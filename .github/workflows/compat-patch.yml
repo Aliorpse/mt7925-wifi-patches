@@ -89,7 +89,7 @@ jobs:
         include:
           - kernel: v6.18
             toolchain: gcc
-            patches: action-frame,eml,nan,aql
+            patches: action-frame,eml,nan,aql,alloc-flex
           - kernel: v7.0
             toolchain: gcc
             patches: action-frame,eml,nan,aql
@@ -178,13 +178,14 @@ jobs:
                 printf native
               fi
             }
-            detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
+            detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s,alloc-flex=%s' \
               "$(feature_state action-frame legacy)" \
               "$(feature_state eml legacy)" \
               "$(feature_state nan disabled)" \
-              "$(feature_state aql pre-aql)")
+              "$(feature_state aql pre-aql)" \
+              "$(feature_state alloc-flex legacy)")
           else
-            detected_features='action-frame=unknown,eml=unknown,nan=unknown,aql=unknown'
+            detected_features='action-frame=unknown,eml=unknown,nan=unknown,aql=unknown,alloc-flex=unknown'
             patch_csv=unavailable
           fi
 
@@ -288,7 +289,7 @@ jobs:
           set -e
           if ((detect_status != 0)); then
             printf '%s\n' \
-              'Detected features: action-frame=unknown,eml=unknown,nan=unknown,aql=unknown'
+              'Detected features: action-frame=unknown,eml=unknown,nan=unknown,aql=unknown,alloc-flex=unknown'
             printf 'Patch IDs: unavailable\n'
             exit "$detect_status"
           fi
@@ -303,11 +304,12 @@ jobs:
               printf native
             fi
           }
-          detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
+          detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s,alloc-flex=%s' \
             "$(feature_state action-frame legacy)" \
             "$(feature_state eml legacy)" \
             "$(feature_state nan disabled)" \
-            "$(feature_state aql pre-aql)")
+            "$(feature_state aql pre-aql)" \
+            "$(feature_state alloc-flex legacy)")
 
           printf 'Detected features: %s\n' "$detected_features"
           printf 'Patch IDs: %s\n' "$patch_csv"

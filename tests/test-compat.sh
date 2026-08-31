@@ -7,6 +7,7 @@ COMPAT="$ROOT_DIR/scripts/compat.sh"
 BUILD_LEGACY="$ROOT_DIR/tests/build-legacy-kernel.sh"
 ACTION_PATCH="$ROOT_DIR/patches/legacy-action-frame-api.patch"
 EML_PATCH="$ROOT_DIR/patches/legacy-eml-api.patch"
+ALLOC_FLEX_PATCH="$ROOT_DIR/patches/legacy-alloc-flex-api.patch"
 WIRELESS_NEXT_REPO="https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git"
 WIRELESS_NEXT_PLAIN="https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git/plain"
 TEST_DIR="$(mktemp -d)"
@@ -113,7 +114,7 @@ fail() {
 make_fixture() {
     local generation=$1
     local kdir="$TEST_DIR/$generation"
-    local action_macro eml_symbols nan_uapi nan_ieee80211 cfg_nan mac_nan
+    local action_macro eml_symbols alloc_flex nan_uapi nan_ieee80211 cfg_nan mac_nan
     local aql_decl aql_export
 
     nan_uapi=''
@@ -122,11 +123,13 @@ make_fixture() {
     mac_nan=''
     aql_decl=''
     aql_export=''
+    alloc_flex='#define kzalloc_flex(P, FAM, COUNT, ...)'
 
     case "$generation" in
         v6.18|v7.0)
             action_macro='#define IEEE80211_MIN_ACTION_SIZE 24'
             eml_symbols=$'#define IEEE80211_EML_CAP_EMLSR_PADDING_DELAY 0\n#define IEEE80211_EML_CAP_EMLSR_TRANSITION_DELAY 0'
+            [[ $generation == v6.18 ]] && alloc_flex=''
             ;;
         v7.1)
             action_macro='#define IEEE80211_MIN_ACTION_SIZE(member) 24'
@@ -163,11 +166,16 @@ make_fixture() {
     rm -rf "$kdir"
     mkdir -p "$kdir/include/linux" "$kdir/include/net" "$kdir/include/uapi/linux"
     printf '%s\n' "$action_macro" > "$kdir/include/linux/ieee80211.h"
-    printf '%s\n' "$eml_symbols" > "$kdir/include/linux/ieee80211-eht.h"
+    if [[ $generation == v6.18 ]]; then
+        printf '%s\n' "$eml_symbols" >> "$kdir/include/linux/ieee80211.h"
+    else
+        printf '%s\n' "$eml_symbols" > "$kdir/include/linux/ieee80211-eht.h"
+    fi
     printf '%s\n' "$nan_ieee80211" > "$kdir/include/linux/ieee80211-nan.h"
     printf '%s\n' "$nan_uapi" > "$kdir/include/uapi/linux/nl80211.h"
     printf '%s\n' "$cfg_nan" > "$kdir/include/net/cfg80211.h"
     printf '%s\n' "$mac_nan" "$aql_decl" > "$kdir/include/net/mac80211.h"
+    printf '%s\n' "$alloc_flex" > "$kdir/include/linux/slab.h"
     printf '%s\n' "$aql_export" > "$kdir/Module.symvers"
     printf '%s\n' "$kdir"
 }
@@ -408,7 +416,7 @@ EOF
     done
     [[ -n $kbuild_dir && $mt76_dir == "$kbuild_dir/drivers/net/wireless/mediatek/mt76" ]] ||
         fail 'current-native build did not use one wireless-next source/header generation'
-    if grep -A1 '^Compatibility patches:$' "$output" | grep -Eq '^(action-frame|eml|nan|aql)$'; then
+    if grep -A1 '^Compatibility patches:$' "$output" | grep -Eq '^(action-frame|eml|nan|aql|alloc-flex)$'; then
         fail 'current-native build selected a compatibility patch'
     fi
 
@@ -457,6 +465,7 @@ assert_unsupported() {
 copy_wireless_next_tree() {
     local remote_head source_file
     local -a source_files=(
+        drivers/net/wireless/mediatek/mt76/agg-rx.c
         drivers/net/wireless/mediatek/mt76/mac80211.c
         drivers/net/wireless/mediatek/mt76/mt76.h
         drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c
@@ -612,6 +621,23 @@ assert_v7_0_patch_scope() {
         fail 'legacy power-save guard is missing after v7.0 patch selection'
 }
 
+assert_v6_18_patch_scope() {
+    local kdir actual agg_rx
+
+    reset_source
+    kdir=$(make_fixture v6.18)
+    actual=$("$COMPAT" apply "$SOURCE_DIR" "$kdir")
+    [[ $actual == $'action-frame\neml\nnan\naql\nalloc-flex' ]] ||
+        fail "v6.18: expected all compatibility patches, got $(printf '%q' "$actual")"
+
+    agg_rx="$SOURCE_DIR/drivers/net/wireless/mediatek/mt76/agg-rx.c"
+    grep -Fq 'kzalloc(struct_size(tid, reorder_buf, size), GFP_KERNEL)' "$agg_rx" ||
+        fail 'legacy flex allocation was not restored for v6.18'
+    grep -q 'kzalloc_flex' "$agg_rx" &&
+        fail 'kzalloc_flex remains after v6.18 patch selection'
+    git -C "$SOURCE_DIR" apply --reverse --check "$ALLOC_FLEX_PATCH"
+}
+
 assert_failed_preflight_is_atomic() {
     local kdir output makefile content changed_files
     local context='obj-$(CONFIG_MT7925E) += mt7925e.o'
@@ -632,7 +658,7 @@ assert_failed_preflight_is_atomic() {
         fail "failed preflight changed source files: $(printf '%q' "$changed_files")"
 }
 
-assert_patches v6.18 $'action-frame\neml\nnan\naql'
+assert_patches v6.18 $'action-frame\neml\nnan\naql\nalloc-flex'
 assert_patches v7.0 $'action-frame\neml\nnan\naql'
 assert_patches v7.1 $'eml\nnan\naql'
 assert_patches v7.2 $'aql'
@@ -646,6 +672,7 @@ assert_unsupported include/linux/ieee80211-eht.h '#define IEEE80211_EML_CAP_UNKN
 
 copy_wireless_next_tree
 assert_action_patch_scope
+assert_v6_18_patch_scope
 assert_v7_0_patch_scope
 assert_failed_preflight_is_atomic
 assert_applied_patches legacy legacy $'action-frame\neml'

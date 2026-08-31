@@ -118,6 +118,7 @@ detect_patches() {
     local kdir=$1
     local action="$kdir/include/linux/ieee80211.h"
     local eml="$kdir/include/linux/ieee80211-eht.h"
+    local slab="$kdir/include/linux/slab.h"
     local ieee80211_nan="$kdir/include/linux/ieee80211-nan.h"
     local nl80211="$kdir/include/uapi/linux/nl80211.h"
     local cfg80211="$kdir/include/net/cfg80211.h"
@@ -125,9 +126,11 @@ detect_patches() {
     local symvers="$kdir/Module.symvers"
     local file current_action=0 legacy_action=0 current_eml=0 legacy_eml=0
 
-    for file in "$action" "$eml" "$nl80211" "$cfg80211" "$mac80211"; do
+    for file in "$action" "$slab" "$nl80211" "$cfg80211" "$mac80211"; do
         [[ -f $file ]] || die "required file not found: $file"
     done
+
+    [[ -f $eml ]] || eml=$action
 
     grep -Eq '^[[:space:]]*#define[[:space:]]+IEEE80211_MIN_ACTION_SIZE\(' "$action" && current_action=1
     grep -Eq '^[[:space:]]*#define[[:space:]]+IEEE80211_MIN_ACTION_SIZE[[:space:]]+' "$action" && legacy_action=1
@@ -157,6 +160,8 @@ detect_patches() {
     elif ! grep -q '[[:space:]]ieee80211_txq_aql_pending[[:space:]]' "$symvers"; then
         printf '%s\n' aql
     fi
+
+    grep -q 'kzalloc_flex' "$slab" || printf '%s\n' alloc-flex
 }
 
 apply_patches() {

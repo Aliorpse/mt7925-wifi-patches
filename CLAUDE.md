@@ -24,12 +24,17 @@ by build metadata:
 - `eml`
 - `nan`
 - `aql`
+- `alloc-flex`
 
 Legacy NAN compatibility disables NAN and NDI as one unit when the host NAN
 contract is incomplete. Linux 6.18, 7.0, and 7.1 select that path. AQL
 compatibility restores the pre-AQL MT7925 sleeping-station branch instead of
 calling an unavailable or unexported helper; the tested old rows through Linux
 7.2 select it.
+
+Linux 6.18 additionally selects `alloc-flex`, restoring the equivalent legacy
+`kzalloc(struct_size(...), GFP_KERNEL)` allocation because its slab headers do
+not provide `kzalloc_flex()`.
 
 Patch application is atomic: every selected patch passes `git apply --check`
 before source changes. Put compatibility changes in independently selectable
@@ -39,7 +44,7 @@ Expected source-tag API coverage:
 
 | Headers | Selected compatibility |
 | --- | --- |
-| Linux 6.18 | action-frame, eml, nan, aql |
+| Linux 6.18 | action-frame, eml, nan, aql, alloc-flex |
 | Linux 7.0 | action-frame, eml, nan, aql |
 | Linux 7.1 | eml, nan, aql |
 | Linux 7.2 | aql |

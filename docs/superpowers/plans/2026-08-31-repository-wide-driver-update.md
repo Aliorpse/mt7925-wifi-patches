@@ -34,6 +34,7 @@
 - `patches/legacy-eml-api.patch`: old EMLSR delay-mask names.
 - `patches/legacy-nan-api.patch`: remove current MT7925 NAN consumer from hosts without the complete NAN contract.
 - `patches/legacy-aql-api.patch`: restore the MT7925-safe pre-AQL sleeping-station branch.
+- `patches/legacy-alloc-flex-api.patch`: restore the pre-`kzalloc_flex()` allocation on Linux 6.18.
 - `mt76-rebuild.sh`: normal-user orchestration, source resolution, build, validation, and privileged helper invocation.
 - `mt76-revert.sh`: confirmation and privileged helper invocation for the running kernel.
 - `mt76-check.sh`: status derived from module resolution, metadata, load state, and MT7925-only settings.
@@ -57,7 +58,7 @@
 **Interfaces:**
 - Produces: `scripts/compat.sh detect KDIR` prints required patch IDs, one per line.
 - Produces: `scripts/compat.sh apply SOURCE_DIR KDIR` applies required patches and prints applied IDs, one per line.
-- Patch IDs are exactly `action-frame`, `eml`, `nan`, and `aql`.
+- Patch IDs are exactly `action-frame`, `eml`, `nan`, `aql`, and `alloc-flex`.
 - `KDIR/Module.symvers` is required when the AQL declaration exists; missing symbol export selects `aql`.
 
 - [ ] **Step 1: Write detection tests for all API generations**
@@ -65,7 +66,7 @@
 Create `tests/test-compat.sh` with a temporary header-tree builder. The assertions must cover:
 
 ```bash
-assert_patches v6.18 $'action-frame\neml\nnan\naql'
+assert_patches v6.18 $'action-frame\neml\nnan\naql\nalloc-flex'
 assert_patches v7.0  $'action-frame\neml\nnan\naql'
 assert_patches v7.1  $'eml\nnan\naql'
 assert_patches v7.2  $'aql'
@@ -77,7 +78,11 @@ Each fixture writes only the signatures the detector consumes:
 ```bash
 mkdir -p "$kdir/include/linux" "$kdir/include/net" "$kdir/include/uapi/linux"
 printf '%s\n' "$action_macro" > "$kdir/include/linux/ieee80211.h"
-printf '%s\n' "$eml_symbols" > "$kdir/include/linux/ieee80211-eht.h"
+if [[ $generation == v6.18 ]]; then
+    printf '%s\n' "$eml_symbols" >> "$kdir/include/linux/ieee80211.h"
+else
+    printf '%s\n' "$eml_symbols" > "$kdir/include/linux/ieee80211-eht.h"
+fi
 printf '%s\n' "$nan_uapi" > "$kdir/include/uapi/linux/nl80211.h"
 printf '%s\n' "$cfg_nan" > "$kdir/include/net/cfg80211.h"
 printf '%s\n' "$mac_nan" "$aql_decl" > "$kdir/include/net/mac80211.h"
@@ -105,6 +110,7 @@ detect_patches() {
     local cfg80211="$kdir/include/net/cfg80211.h"
     local mac80211="$kdir/include/net/mac80211.h"
 
+    [[ -f $eml ]] || eml=$action
     grep -Eq '^[[:space:]]*#define[[:space:]]+IEEE80211_MIN_ACTION_SIZE\(' "$action" || printf '%s\n' action-frame
     grep -q 'IEEE80211_EML_CAP_EML_PADDING_DELAY' "$eml" || printf '%s\n' eml
 

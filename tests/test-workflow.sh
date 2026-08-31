@@ -25,4 +25,14 @@ native_row=$(awk '
 [[ $(grep -Fc -- '- kernel: current-native' "$WORKFLOW") -eq 1 ]] ||
     fail 'current-native API row must appear exactly once'
 
+v618_row=$(awk '
+    /- kernel: v6.18/ { capture = 1 }
+    capture { print }
+    capture && /patches:/ { exit }
+' "$WORKFLOW")
+[[ $v618_row == *'patches: action-frame,eml,nan,aql,alloc-flex'* ]] ||
+    fail 'Linux 6.18 matrix row omits alloc-flex compatibility'
+grep -Fq 'alloc-flex=%s' "$WORKFLOW" ||
+    fail 'workflow diagnostics omit alloc-flex feature state'
+
 printf 'Workflow static gate and current-native matrix contract passed.\n'

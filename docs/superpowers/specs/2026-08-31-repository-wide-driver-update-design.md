@@ -122,9 +122,9 @@ mt7996 hunk.
 
 ### EML constant names
 
-Probe `include/linux/ieee80211-eht.h` independently for generic
-`IEEE80211_EML_CAP_EML_*` versus legacy
-`IEEE80211_EML_CAP_EMLSR_*` delay masks.
+Probe `include/linux/ieee80211-eht.h` when present, otherwise the legacy
+combined `include/linux/ieee80211.h`, for generic `IEEE80211_EML_CAP_EML_*`
+versus legacy `IEEE80211_EML_CAP_EMLSR_*` delay masks.
 
 On legacy headers, rewrite only the two MT7925 delay-mask references. This must
 run even when the action-frame API is already modern, which is the Linux 7.1
@@ -160,11 +160,17 @@ instead of calling the helper. This is safe for this project's MT7925-only
 configuration because MT7925 does not enable the new hardware-managed power-save
 buffering flag. The patch must be revisited before supporting mt7915 or mt7996.
 
+### Flexible-array allocator API
+
+Probe `include/linux/slab.h` for `kzalloc_flex()`. When absent, replace the
+current mt76 receive-aggregation allocation with the equivalent overflow-safe
+legacy form `kzalloc(struct_size(tid, reorder_buf, size), GFP_KERNEL)`.
+
 ### Expected API matrix
 
 | Target headers | Compatibility selected |
 | --- | --- |
-| Linux 6.18 | Action + EML + NAN disabled + AQL rollback |
+| Linux 6.18 | Action + EML + NAN disabled + AQL rollback + alloc-flex rollback |
 | Linux 7.0 | Action + EML + NAN disabled + AQL rollback |
 | Linux 7.1 | EML + NAN disabled + AQL rollback |
 | Linux 7.2 | AQL rollback |

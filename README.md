@@ -35,6 +35,10 @@ selected by the tested old rows through Linux 7.2, restores the
 pre-AQL MT7925 sleeping-station branch instead of calling an unavailable or
 unexported AQL helper.
 
+Linux 6.18 also selects `alloc-flex`: current mt76's `kzalloc_flex()` call is
+rewritten to the overflow-safe legacy `kzalloc(struct_size(...), GFP_KERNEL)`
+form because that helper was introduced later.
+
 Source-tag and current-native jobs use `modules_prepare` and permit unresolved
 base-kernel symbols, so they test API compatibility, not whether a module can
 be loaded. A separate CI job builds against Fedora Rawhide's packaged
