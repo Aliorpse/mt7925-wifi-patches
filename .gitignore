@@ -1,6 +1,7 @@
 # Source trees (downloaded by rebuild script)
 wireless-next/
 openwrt-mt76/
+.worktrees/
 
 # Backup modules
 backup-modules/
