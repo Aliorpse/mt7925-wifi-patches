@@ -7,6 +7,13 @@ KERNEL_REF="${KERNEL_REF:-v7.0}"
 WIRELESS_NEXT_REF="${WIRELESS_NEXT_REF:-main}"
 WIRELESS_NEXT_REPO="https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git"
 TEST_DIR="$(mktemp -d)"
+KBUILD_TOOL_ARGS=()
+
+for tool in LLVM LLVM_IAS CC LD AR NM STRIP OBJCOPY OBJDUMP READELF HOSTCC HOSTCXX; do
+    if declare -p "$tool" >/dev/null 2>&1; then
+        KBUILD_TOOL_ARGS+=("$tool=${!tool-}")
+    fi
+done
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -15,8 +22,8 @@ trap cleanup EXIT
 
 git clone --depth=1 --branch "$KERNEL_REF" \
     https://github.com/torvalds/linux.git "$TEST_DIR/linux"
-make -C "$TEST_DIR/linux" defconfig
-make -C "$TEST_DIR/linux" -j"$(nproc)" modules_prepare
+make "${KBUILD_TOOL_ARGS[@]}" -C "$TEST_DIR/linux" defconfig
+make "${KBUILD_TOOL_ARGS[@]}" -C "$TEST_DIR/linux" -j"$(nproc)" modules_prepare
 
 git init --quiet "$TEST_DIR/wireless-next"
 git -C "$TEST_DIR/wireless-next" fetch --depth=1 \
@@ -39,7 +46,7 @@ printf 'Compatibility patches:\n'
 mt76_dir="$TEST_DIR/wireless-next/drivers/net/wireless/mediatek/mt76"
 printf '%s\n' \
     'API compile check: KBUILD_MODPOST_WARN=1 because modules_prepare has no complete Module.symvers.'
-make -C "$TEST_DIR/linux" M="$mt76_dir" \
+make "${KBUILD_TOOL_ARGS[@]}" -C "$TEST_DIR/linux" M="$mt76_dir" \
     CONFIG_MT76_CORE=m \
     CONFIG_MT76_CONNAC_LIB=m \
     CONFIG_MT792x_LIB=m \

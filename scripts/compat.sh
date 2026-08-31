@@ -9,10 +9,116 @@ die() {
     exit 1
 }
 
+has_tokens() {
+    local file=$1 token
+
+    shift
+    [[ -f $file ]] || return 1
+    for token in "$@"; do
+        grep -Fq -- "$token" "$file" || return 1
+    done
+}
+
+struct_has_members() {
+    local file=$1 name=$2 body member
+
+    shift 2
+    body=$(awk -v declaration="struct $name {" '
+        $0 == declaration { inside = 1 }
+        inside { print }
+        inside && $0 == "};" { exit }
+    ' "$file")
+    [[ $body == *"struct $name {"* ]] || return 1
+    for member in "$@"; do
+        [[ $body == *"$member"* ]] || return 1
+    done
+}
+
+has_nan_api() {
+    local ieee80211_nan=$1 nl80211=$2 cfg80211=$3 mac80211=$4
+
+    has_tokens "$ieee80211_nan" \
+        '#define NAN_OP_MODE_PHY_MODE_MASK' \
+        '#define NAN_DEV_CAPA_EXT_KEY_ID_SUPPORTED' &&
+    has_tokens "$nl80211" \
+        'NL80211_IFTYPE_NAN,' \
+        'NL80211_IFTYPE_NAN_DATA,' \
+        'NL80211_EXT_FEATURE_SECURE_NAN,' &&
+    has_tokens "$cfg80211" \
+        '#define CFG80211_NAN_SCHED_NUM_TIME_SLOTS' \
+        '#define CFG80211_NAN_MAX_PEER_MAPS' \
+        '#define CFG80211_NAN_INVALID_MAP_ID' \
+        'WIPHY_NAN_FLAGS_CONFIGURABLE_SYNC =' \
+        'WIPHY_NAN_FLAGS_USERSPACE_DE' \
+        'void cfg80211_next_nan_dw_notif(' &&
+    struct_has_members "$cfg80211" cfg80211_nan_band_config \
+        'struct ieee80211_channel *chan;' \
+        's8 rssi_close;' \
+        's8 rssi_middle;' \
+        'u8 awake_dw_interval;' &&
+    struct_has_members "$cfg80211" cfg80211_nan_conf \
+        'u8 master_pref;' \
+        'u8 bands;' \
+        'u8 cluster_id[ETH_ALEN]' \
+        'u16 scan_period;' \
+        'u16 scan_dwell_time;' \
+        'u8 discovery_beacon_interval;' \
+        'bool enable_dw_notification;' \
+        'struct cfg80211_nan_band_config band_cfgs[' &&
+    struct_has_members "$cfg80211" wiphy_nan_capa \
+        'u32 flags;' \
+        'u8 op_mode;' \
+        'u8 n_antennas;' \
+        'u16 max_channel_switch_time;' \
+        'u8 dev_capabilities;' \
+        'struct ieee80211_sta_ht_cap ht;' \
+        'struct ieee80211_sta_vht_cap vht;' \
+        'struct ieee80211_sta_he_cap he;' \
+        '} phy;' &&
+    struct_has_members "$cfg80211" wiphy \
+        'u8 nan_supported_bands;' \
+        'struct wiphy_nan_capa nan_capa;' &&
+    has_tokens "$mac80211" \
+        'BSS_CHANGED_NAN_LOCAL_SCHED' \
+        'struct wireless_dev *ieee80211_vif_to_wdev(' \
+        'void ieee80211_nan_sched_update_done(' \
+        'void ieee80211_nan_cluster_joined(' \
+        'bool ieee80211_vif_nan_started(' &&
+    struct_has_members "$mac80211" ieee80211_nan_channel \
+        'struct ieee80211_chanctx_conf *chanctx_conf;' \
+        'u8 channel_entry[' &&
+    struct_has_members "$mac80211" ieee80211_nan_peer_map \
+        'u8 map_id;' \
+        'struct ieee80211_nan_channel *slots[' &&
+    struct_has_members "$mac80211" ieee80211_nan_peer_sched \
+        'u16 max_chan_switch;' \
+        'struct ieee80211_nan_peer_map maps[' \
+        'u8 n_channels;' \
+        'struct ieee80211_nan_channel channels[]' &&
+    struct_has_members "$mac80211" ieee80211_nan_sched_cfg \
+        'struct ieee80211_nan_channel *schedule[' \
+        'u8 avail_blob[' \
+        'u16 avail_blob_len;' \
+        'bool deferred;' &&
+    struct_has_members "$mac80211" ieee80211_vif_cfg \
+        'struct ieee80211_nan_sched_cfg nan_sched;' &&
+    struct_has_members "$mac80211" ieee80211_vif \
+        'struct ieee80211_vif_cfg cfg;' &&
+    struct_has_members "$mac80211" ieee80211_sta \
+        'struct ieee80211_sta __rcu *nmi;' \
+        'struct ieee80211_nan_peer_sched *nan_sched;' &&
+    struct_has_members "$mac80211" ieee80211_ops \
+        '(*start_nan)(' \
+        '(*stop_nan)(' \
+        '(*nan_change_conf)(' \
+        '(*nan_peer_sched_changed)('
+}
+
 detect_patches() {
     local kdir=$1
     local action="$kdir/include/linux/ieee80211.h"
     local eml="$kdir/include/linux/ieee80211-eht.h"
+    local ieee80211_nan="$kdir/include/linux/ieee80211-nan.h"
     local nl80211="$kdir/include/uapi/linux/nl80211.h"
     local cfg80211="$kdir/include/net/cfg80211.h"
     local mac80211="$kdir/include/net/mac80211.h"
@@ -40,13 +146,7 @@ detect_patches() {
     ((current_action)) || printf '%s\n' action-frame
     ((current_eml)) || printf '%s\n' eml
 
-    if ! grep -q 'NL80211_IFTYPE_NAN_DATA' "$nl80211" ||
-       ! grep -q 'CFG80211_NAN_SCHED_NUM_TIME_SLOTS' "$cfg80211" ||
-       ! grep -q 'CFG80211_NAN_MAX_PEER_MAPS' "$cfg80211" ||
-       ! grep -q 'BSS_CHANGED_NAN_LOCAL_SCHED' "$mac80211" ||
-       ! grep -q 'nan_peer_sched_changed' "$mac80211" ||
-       ! grep -q 'ieee80211_nan_sched_update_done' "$mac80211" ||
-       ! grep -q 'ieee80211_nan_cluster_joined' "$mac80211"; then
+    if ! has_nan_api "$ieee80211_nan" "$nl80211" "$cfg80211" "$mac80211"; then
         printf '%s\n' nan
     fi
 
