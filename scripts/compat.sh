@@ -19,7 +19,7 @@ detect_patches() {
     local symvers="$kdir/Module.symvers"
     local file current_action=0 legacy_action=0 current_eml=0 legacy_eml=0
 
-    for file in "$action" "$eml" "$nl80211" "$cfg80211" "$mac80211" "$symvers"; do
+    for file in "$action" "$eml" "$nl80211" "$cfg80211" "$mac80211"; do
         [[ -f $file ]] || die "required file not found: $file"
     done
 
@@ -49,8 +49,11 @@ detect_patches() {
         printf '%s\n' nan
     fi
 
-    if ! grep -q 'ieee80211_txq_aql_pending' "$mac80211" ||
-       ! grep -q '[[:space:]]ieee80211_txq_aql_pending[[:space:]]' "$symvers"; then
+    if ! grep -q 'ieee80211_txq_aql_pending' "$mac80211"; then
+        printf '%s\n' aql
+    elif [[ ! -f $symvers ]]; then
+        die "required file not found: $symvers"
+    elif ! grep -q '[[:space:]]ieee80211_txq_aql_pending[[:space:]]' "$symvers"; then
         printf '%s\n' aql
     fi
 }

@@ -89,6 +89,23 @@ assert_patches() {
         fail "$generation: expected $(printf '%q' "$expected"), got $(printf '%q' "$actual")"
 }
 
+assert_aql_without_symvers() {
+    local kdir actual
+    local stderr="$TEST_DIR/no-aql-symvers.stderr"
+
+    kdir=$(make_fixture v7.1)
+    printf '%s\n' \
+        '#define IEEE80211_EML_CAP_EML_PADDING_DELAY 0' \
+        '#define IEEE80211_EML_CAP_EML_TRANSITION_DELAY 0' > "$kdir/include/linux/ieee80211-eht.h"
+    rm "$kdir/Module.symvers"
+
+    if ! actual=$("$COMPAT" detect "$kdir" 2> "$stderr"); then
+        fail 'detection failed without an AQL declaration'
+    fi
+    [[ ! -s $stderr ]] || fail 'detection read missing Module.symvers without an AQL declaration'
+    [[ $actual == aql ]] || fail "missing AQL declaration: expected aql, got $(printf '%q' "$actual")"
+}
+
 assert_unsupported() {
     local header=$1
     local content=$2
@@ -223,6 +240,7 @@ assert_patches v7.0 $'action-frame\neml\nnan\naql'
 assert_patches v7.1 $'eml\naql'
 assert_patches v7.2 $'aql'
 assert_patches current ''
+assert_aql_without_symvers
 
 assert_unsupported include/linux/ieee80211.h '#define IEEE80211_MIN_ACTION_LENGTH 24'
 assert_unsupported include/linux/ieee80211-eht.h '#define IEEE80211_EML_CAP_UNKNOWN 0'
