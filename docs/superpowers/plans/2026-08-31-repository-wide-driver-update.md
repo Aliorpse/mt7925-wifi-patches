@@ -67,7 +67,7 @@ Create `tests/test-compat.sh` with a temporary header-tree builder. The assertio
 ```bash
 assert_patches v6.18 $'action-frame\neml\nnan\naql'
 assert_patches v7.0  $'action-frame\neml\nnan\naql'
-assert_patches v7.1  $'eml\naql'
+assert_patches v7.1  $'eml\nnan\naql'
 assert_patches v7.2  $'aql'
 assert_patches current ''
 ```
@@ -235,7 +235,7 @@ KERNEL_REF=v7.2 ./tests/build-legacy-kernel.sh
 KERNEL_REF=v7.1 LLVM=1 ./tests/build-legacy-kernel.sh
 ```
 
-Expected: all configured objects compile; v7.0 reports all four patches, v7.1 reports EML+AQL, v7.2 reports AQL, and Clang preserves `LLVM=1`.
+Expected: all configured objects compile; v7.0 reports all four patches, v7.1 reports EML+NAN+AQL because it lacks `ieee80211_nan_cluster_joined()`, v7.2 reports AQL, and Clang preserves `LLVM=1`.
 
 - [ ] **Step 7: Commit current-source compatibility**
 

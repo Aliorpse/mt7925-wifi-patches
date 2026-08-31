@@ -162,7 +162,7 @@ buffering flag. The patch must be revisited before supporting mt7915 or mt7996.
 | --- | --- |
 | Linux 6.18 | Action + EML + NAN disabled + AQL rollback |
 | Linux 7.0 | Action + EML + NAN disabled + AQL rollback |
-| Linux 7.1 | EML + AQL rollback |
+| Linux 7.1 | EML + NAN disabled + AQL rollback |
 | Linux 7.2 | AQL rollback |
 | Current native API | No patch expected |
 
@@ -370,7 +370,7 @@ After the implementation and all available verification pass:
 | Issue | Resolution evidence |
 | --- | --- |
 | #1 | Status is based on current-kernel module resolution, metadata, and load state; install metadata is created only after successful activation. Ubuntu flow and failure paths are covered without relying on a marker. |
-| #4 | Linux 7.1 receives EML compatibility independently from the already-modern action API; Linux 6.18 is covered by the complete legacy combination. |
+| #4 | Linux 7.1 receives EML compatibility independently from the already-modern action API and disables NAN because the tag lacks the required mac80211 cluster-join helper; Linux 6.18 is covered by the complete legacy combination. |
 | #5 | Missing AQL declaration/export selects the safe rollback, and a Clang/`LLVM=1` old-kernel job passes while preserving compiler variables. |
 | #6 | The same AQL compatibility path passes the Linux 7.1/GCC job and produces all five expected modules. |
 | Closed #2 | A follow-up explains that NAN and AQL regressions added after its original action-frame fix are now covered. |
