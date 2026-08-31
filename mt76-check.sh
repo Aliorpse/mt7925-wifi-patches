@@ -1,47 +1,207 @@
-#!/bin/bash
-# MT7925 WiFi Patch Status Checker
+#!/usr/bin/env bash
 
-KVER=$(uname -r)
-MARKER="/lib/modules/$KVER/kernel/drivers/net/wireless/mediatek/mt76/.custom-mt76"
-MODPROBE_CONF="/etc/modprobe.d/mt7925.conf"
-WIFI_IFACE=$(iw dev 2>/dev/null | awk '/Interface/ && !/p2p/{print $2; exit}')
+set -u
 
-# Check ASPM status
-if [[ -f "$MODPROBE_CONF" ]] && grep -q "disable_aspm=1" "$MODPROBE_CONF" 2>/dev/null; then
-    ASPM_STATUS="✓ ASPM: Disabled"
-else
-    ASPM_STATUS="✗ ASPM: Enabled (may cause issues)"
+PROJECT='mt7925-wifi-patches'
+MODULES_ROOT=${MT7925_MODULES_ROOT:-/lib/modules}
+ETC_ROOT=${MT7925_ETC_ROOT:-/etc}
+PROC_MODULES=${MT7925_PROC_MODULES:-/proc/modules}
+SYS_CLASS_NET=${MT7925_SYS_CLASS_NET:-/sys/class/net}
+UNAME=${MT7925_UNAME:-uname}
+MODINFO=${MT7925_MODINFO:-modinfo}
+IW=${MT7925_IW:-iw}
+NOTIFY_SEND=${MT7925_NOTIFY_SEND:-notify-send}
+
+if [[ $# -gt 1 || ($# -eq 1 && $1 != --text) ]]; then
+    printf 'usage: %s [--text]\n' "${0##*/}" >&2
+    exit 2
+fi
+text_mode=0
+[[ $# -eq 0 ]] || text_mode=1
+
+if ! KVER=$("$UNAME" -r 2>/dev/null) || [[ -z $KVER ]]; then
+    printf '%s: could not determine the running kernel\n' "${0##*/}" >&2
+    exit 1
 fi
 
-# Check power save status
-if [[ -n "$WIFI_IFACE" ]]; then
-    PS_STATE=$(iw dev "$WIFI_IFACE" get power_save 2>/dev/null | awk '{print $3}')
-    if [[ "$PS_STATE" == "off" ]]; then
-        PS_STATUS="✓ Power Save: Off"
-    else
-        PS_STATUS="✗ Power Save: On (may cause issues)"
-    fi
-else
-    PS_STATUS="? Power Save: Unknown"
+OVERLAY="$MODULES_ROOT/$KVER/updates/$PROJECT"
+BUILD_INFO="$OVERLAY/.build-info"
+ASPM_CONFIG="$ETC_ROOT/modprobe.d/99-$PROJECT.conf"
+POWER_DISPATCHER="$ETC_ROOT/NetworkManager/dispatcher.d/99-$PROJECT"
+
+module_path=''
+state=unknown
+metadata_kernel=''
+source_sha=''
+compiler=''
+patches=''
+
+if module_path=$("$MODINFO" -n mt7925e 2>/dev/null) && [[ -n $module_path ]]; then
+    case $module_path in
+        "$OVERLAY"/*)
+            if [[ ! -r $BUILD_INFO ]]; then
+                state=missing
+            else
+                kernel_seen=0
+                source_seen=0
+                compiler_seen=0
+                patches_seen=0
+                duplicate=0
+                while IFS= read -r line; do
+                    case $line in
+                        kernel=*)
+                            ((kernel_seen)) && duplicate=1
+                            metadata_kernel=${line#kernel=}
+                            kernel_seen=1
+                            ;;
+                        source_sha=*)
+                            ((source_seen)) && duplicate=1
+                            source_sha=${line#source_sha=}
+                            source_seen=1
+                            ;;
+                        compiler=*)
+                            ((compiler_seen)) && duplicate=1
+                            compiler=${line#compiler=}
+                            compiler_seen=1
+                            ;;
+                        patches=*)
+                            ((patches_seen)) && duplicate=1
+                            patches=${line#patches=}
+                            patches_seen=1
+                            ;;
+                    esac
+                done < "$BUILD_INFO"
+
+                if ((duplicate || !kernel_seen || !source_seen || !compiler_seen || !patches_seen)) ||
+                    [[ -z $metadata_kernel || -z $source_sha || -z $compiler || -z $patches ]]; then
+                    state=missing
+                elif [[ $metadata_kernel != "$KVER" || ! $source_sha =~ ^[0-9a-f]{40}$ ]]; then
+                    state=stale
+                else
+                    state=unloaded
+                    if [[ -r $PROC_MODULES ]]; then
+                        while read -r name rest; do
+                            if [[ $name == mt7925e ]]; then
+                                state=loaded
+                                break
+                            fi
+                        done < "$PROC_MODULES"
+                    fi
+                fi
+            fi
+            ;;
+        *) state=stock ;;
+    esac
 fi
 
-if [[ -f "$MARKER" ]]; then
-    STATUS="✓ All Good"
-    URGENCY="normal"
-    MSG="✓ Driver: Patched
-$ASPM_STATUS
-$PS_STATUS
-
-Kernel: $KVER"
-else
-    STATUS="✗ Action Needed"
-    URGENCY="critical"
-    MSG="✗ Driver: Not Patched
-$ASPM_STATUS
-$PS_STATUS
-
+urgency=critical
+exit_status=1
+case $state in
+    loaded)
+        TITLE='MT7925 WiFi: Custom driver loaded'
+        BODY="Driver: Custom (loaded)
 Kernel: $KVER
+Source: $source_sha
+Compiler: $compiler
+Patches: $patches"
+        urgency=normal
+        exit_status=0
+        ;;
+    unloaded)
+        TITLE='MT7925 WiFi: Custom driver not loaded'
+        BODY="Driver: Custom (installed, not loaded)
+Kernel: $KVER
+Source: $source_sha
+Compiler: $compiler
+Patches: $patches
+Run: sudo modprobe mt7925e"
+        ;;
+    stale)
+        TITLE='MT7925 WiFi: Stale custom metadata'
+        BODY="Driver: Custom (stale metadata)
+Running kernel: $KVER
+Metadata kernel: $metadata_kernel
+Source: $source_sha
 Run: sudo ./mt76-rebuild.sh"
+        ;;
+    missing)
+        TITLE='MT7925 WiFi: Custom metadata missing'
+        BODY="Driver: Custom (metadata missing or incomplete)
+Kernel: $KVER
+Metadata: $BUILD_INFO
+Run: sudo ./mt76-rebuild.sh"
+        ;;
+    stock)
+        TITLE='MT7925 WiFi: Stock driver'
+        BODY="Driver: Stock (custom not installed)
+Kernel: $KVER
+Resolved module: $module_path
+Run: sudo ./mt76-rebuild.sh"
+        ;;
+    *)
+        TITLE='MT7925 WiFi: Driver state unknown'
+        BODY="Driver: Unknown (mt7925e did not resolve)
+Kernel: $KVER"
+        ;;
+esac
+
+ASPM_STATUS='ASPM: Default (not requested)'
+if [[ -f $ASPM_CONFIG ]] &&
+    grep -Fqx '# Generated by mt7925-wifi-patches' "$ASPM_CONFIG" 2>/dev/null &&
+    grep -Fqx 'options mt7925e disable_aspm=1' "$ASPM_CONFIG" 2>/dev/null; then
+    ASPM_STATUS='ASPM: Disabled (requested)'
 fi
 
-notify-send -u "$URGENCY" -t 10000 "MT7925 WiFi: $STATUS" "$MSG"
+power_save_requested=0
+if [[ -f $POWER_DISPATCHER ]] &&
+    grep -Fqx '# Generated by mt7925-wifi-patches' "$POWER_DISPATCHER" 2>/dev/null; then
+    power_save_requested=1
+fi
+
+PS_STATUS='Power Save: Unknown (no mt7925e interface)'
+iw_output=''
+if iw_output=$("$IW" dev 2>/dev/null); then
+    while read -r kind iface rest; do
+        [[ $kind == Interface && -n ${iface-} ]] || continue
+        module_link=$(readlink -f -- "$SYS_CLASS_NET/$iface/device/driver/module" 2>/dev/null) || continue
+        [[ ${module_link##*/} == mt7925e ]] || continue
+
+        power_state=''
+        if power_output=$("$IW" dev "$iface" get power_save 2>/dev/null); then
+            while read -r first second value rest; do
+                if [[ $first == Power && $second == save: ]]; then
+                    power_state=$value
+                    break
+                fi
+            done <<< "$power_output"
+        fi
+        case $power_state in
+            off) PS_STATUS="Power Save ($iface): Off" ;;
+            on)
+                if ((power_save_requested)); then
+                    PS_STATUS="Power Save ($iface): On (requested off)"
+                else
+                    PS_STATUS="Power Save ($iface): On (default)"
+                fi
+                ;;
+            *) PS_STATUS="Power Save ($iface): Unknown" ;;
+        esac
+        break
+    done <<< "$iw_output"
+fi
+
+BODY+=$'\n'"$ASPM_STATUS"$'\n'"$PS_STATUS"
+
+print_text() {
+    printf '%s\n%s\n' "$TITLE" "$BODY"
+}
+
+if ((text_mode)); then
+    print_text
+elif command -v "$NOTIFY_SEND" >/dev/null 2>&1; then
+    "$NOTIFY_SEND" -u "$urgency" -t 10000 "$TITLE" "$BODY" || print_text
+else
+    print_text
+fi
+
+exit "$exit_status"
