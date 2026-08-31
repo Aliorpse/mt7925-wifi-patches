@@ -9,6 +9,7 @@ KDIR="${MT7925_KDIR:-/lib/modules/$KVER/build}"
 SOURCE_ROOT="$SCRIPT_DIR/wireless-next"
 MT76_DIR="$SOURCE_ROOT/drivers/net/wireless/mediatek/mt76"
 SIG_ENFORCE_FILE="${MT7925_SIG_ENFORCE_FILE:-/sys/module/module/parameters/sig_enforce}"
+LOCKDOWN_FILE="${MT7925_LOCKDOWN_FILE:-/sys/kernel/security/lockdown}"
 disable_aspm=0
 disable_power_save=0
 signature_enforced=0
@@ -50,12 +51,21 @@ user_id=$(id -u)
 [[ -d $KDIR ]] || die "kernel build directory not found: $KDIR"
 [[ -r $SIG_ENFORCE_FILE ]] ||
     die "cannot determine module signature enforcement from $SIG_ENFORCE_FILE"
+[[ -r $LOCKDOWN_FILE ]] ||
+    die "cannot determine kernel lockdown state from $LOCKDOWN_FILE"
 
 signature_state=$(<"$SIG_ENFORCE_FILE")
 case $signature_state in
     1|Y|y) signature_enforced=1 ;;
     0|N|n) ;;
     *) die "unknown module signature enforcement state: $signature_state" ;;
+esac
+
+lockdown_state=$(<"$LOCKDOWN_FILE")
+case $lockdown_state in
+    *'[integrity]'*|*'[confidentiality]'*) signature_enforced=1 ;;
+    *'[none]'*) ;;
+    *) die "unknown kernel lockdown state: $lockdown_state" ;;
 esac
 
 for tool in LLVM LLVM_IAS CC LD AR NM STRIP OBJCOPY OBJDUMP READELF HOSTCC HOSTCXX; do
@@ -82,7 +92,7 @@ printf 'Compiler: %s\n' "$compiler_identity"
 
 if [[ ! -d $SOURCE_ROOT/.git ]]; then
     [[ ! -e $SOURCE_ROOT ]] || die "source path is not a git repository: $SOURCE_ROOT"
-    git clone --no-checkout "$WIRELESS_NEXT_REPO" "$SOURCE_ROOT"
+    git clone --depth=1 --branch main --no-checkout "$WIRELESS_NEXT_REPO" "$SOURCE_ROOT"
 fi
 
 git -C "$SOURCE_ROOT" remote set-url origin "$WIRELESS_NEXT_REPO"
@@ -104,10 +114,24 @@ printf 'Compatibility patches: %s\n' "$patches"
 make "${KBUILD_TOOL_ARGS[@]}" -C "$KDIR" M="$MT76_DIR" clean
 make "${KBUILD_TOOL_ARGS[@]}" -C "$KDIR" M="$MT76_DIR" \
     CONFIG_MT76_CORE=m \
+    CONFIG_MT76_USB=n \
+    CONFIG_MT76_SDIO=n \
+    CONFIG_MT76x02_LIB=n \
+    CONFIG_MT76x02_USB=n \
     CONFIG_MT76_CONNAC_LIB=m \
     CONFIG_MT792x_LIB=m \
+    CONFIG_MT792x_USB=n \
+    CONFIG_MT76_NPU= \
+    CONFIG_MT76x0_COMMON=n \
+    CONFIG_MT76x2_COMMON=n \
+    CONFIG_MT7603E=n \
+    CONFIG_MT7615_COMMON=n \
+    CONFIG_MT7915E=n \
+    CONFIG_MT7921_COMMON=n \
+    CONFIG_MT7996E=n \
     CONFIG_MT7925_COMMON=m \
     CONFIG_MT7925E=m \
+    CONFIG_MT7925U=n \
     modules -j"$(nproc)"
 
 stage_dir=$(mktemp -d)

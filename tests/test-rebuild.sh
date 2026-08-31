@@ -11,6 +11,7 @@ REMOTE_WORK="$TEST_DIR/remote-work"
 FAKE_BIN="$TEST_DIR/fake-bin"
 KDIR="$TEST_DIR/kernel-build"
 SIG_ENFORCE="$TEST_DIR/sig-enforce"
+LOCKDOWN="$TEST_DIR/lockdown"
 KVER='7.2.0-test'
 SOURCE_SHA=''
 RUN_ROOT=''
@@ -255,6 +256,7 @@ run_rebuild() {
     MT7925_WIRELESS_NEXT_REPO="$REMOTE" \
     MT7925_KDIR="$KDIR" \
     MT7925_SIG_ENFORCE_FILE="$SIG_ENFORCE" \
+    MT7925_LOCKDOWN_FILE="$LOCKDOWN" \
     MT7925_INSTALL_HELPER="$INSTALL_HELPER" \
     LLVM=1 CC=clang \
         "$RUN_ROOT/mt76-rebuild.sh" "$@" > "$OUTPUT" 2>&1
@@ -299,9 +301,67 @@ assert_make_variables() {
     [[ $calls -gt 0 ]] || fail 'make was not invoked'
 }
 
+assert_pcie_only_build() {
+    local line expected arg modules_calls=0
+    local -a enabled=(
+        CONFIG_MT76_CORE=m
+        CONFIG_MT76_CONNAC_LIB=m
+        CONFIG_MT792x_LIB=m
+        CONFIG_MT7925_COMMON=m
+        CONFIG_MT7925E=m
+    )
+    local -a disabled=(
+        CONFIG_MT76_USB=n
+        CONFIG_MT76_SDIO=n
+        CONFIG_MT76x02_LIB=n
+        CONFIG_MT76x02_USB=n
+        CONFIG_MT792x_USB=n
+        CONFIG_MT76_NPU=
+        CONFIG_MT76x0_COMMON=n
+        CONFIG_MT76x2_COMMON=n
+        CONFIG_MT7603E=n
+        CONFIG_MT7615_COMMON=n
+        CONFIG_MT7915E=n
+        CONFIG_MT7921_COMMON=n
+        CONFIG_MT7996E=n
+        CONFIG_MT7925U=n
+    )
+
+    while IFS= read -r line; do
+        line=" $line "
+        [[ $line == *' modules '* ]] || continue
+        ((modules_calls += 1))
+        for expected in "${enabled[@]}" "${disabled[@]}"; do
+            [[ $line == *" $expected "* ]] ||
+                fail "PCIe-only build omitted $expected"
+        done
+        for arg in $line; do
+            case $arg in
+                CONFIG_MT*=m)
+                    case " ${enabled[*]} " in
+                        *" $arg "*) ;;
+                        *) fail "PCIe-only build enabled unrelated $arg" ;;
+                    esac
+                    ;;
+            esac
+        done
+    done < "$MAKE_LOG"
+    [[ $modules_calls -eq 1 ]] || fail "expected one modules build, got $modules_calls"
+}
+
+assert_shallow_clone() {
+    local actual expected
+
+    expected="clone --depth=1 --branch main --no-checkout $REMOTE $RUN_ROOT/wireless-next"
+    IFS= read -r actual < "$RUN_ROOT/git.log"
+    [[ $actual == "$expected" ]] ||
+        fail "expected shallow main clone, got $(printf '%q' "$actual")"
+}
+
 assert_failure_before_install() {
     FAIL_STAGE=$1
     printf 'N\n' > "$SIG_ENFORCE"
+    printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
     [[ $FAIL_STAGE != signature ]] || printf 'Y\n' > "$SIG_ENFORCE"
     clear_install
     if run_rebuild; then
@@ -327,6 +387,7 @@ make_run_root normal-run
 FAKE_ROOT=0
 FAIL_STAGE=''
 printf 'N\n' > "$SIG_ENFORCE"
+printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
 
 if ! run_rebuild --help; then
     fail '--help failed'
@@ -346,7 +407,9 @@ if ! run_rebuild; then
 fi
 assert_contains "$OUTPUT" "$SOURCE_SHA"
 assert_install_args 0 0
+assert_shallow_clone
 assert_make_variables
+assert_pcie_only_build
 assert_stage $'kernel=7.2.0-test\nsource_sha='"$SOURCE_SHA"$'\ncompiler=clang version rebuild-test\npatches=action-frame,aql'
 
 clear_install
@@ -365,8 +428,29 @@ assert_failure_before_install module-format
 assert_failure_before_install vermagic
 assert_failure_before_install signature
 
+for lockdown_state in 'none [integrity] confidentiality' 'none integrity [confidentiality]'; do
+    FAIL_STAGE=signature
+    printf 'N\n' > "$SIG_ENFORCE"
+    printf '%s\n' "$lockdown_state" > "$LOCKDOWN"
+    clear_install
+    if run_rebuild; then
+        fail "unsigned modules were accepted under lockdown: $lockdown_state"
+    fi
+    assert_no_install
+done
+
+FAIL_STAGE=''
+printf 'N\n' > "$SIG_ENFORCE"
+printf 'unknown\n' > "$LOCKDOWN"
+clear_install
+if run_rebuild; then
+    fail 'unknown lockdown state was accepted'
+fi
+assert_no_install
+
 FAIL_STAGE=''
 printf 'unknown\n' > "$SIG_ENFORCE"
+printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
 clear_install
 if run_rebuild; then
     fail 'unknown signature-enforcement state was accepted'
@@ -375,6 +459,7 @@ assert_no_install
 
 FAKE_PATCHES=''
 printf 'Y\n' > "$SIG_ENFORCE"
+printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
 clear_install
 if ! run_rebuild --disable-aspm --disable-power-save; then
     fail "signed optional-settings flow failed: $(<"$OUTPUT")"
