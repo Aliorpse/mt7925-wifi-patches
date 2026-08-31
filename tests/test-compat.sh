@@ -50,7 +50,7 @@ make_fixture() {
             eml_symbols=$'#define IEEE80211_EML_CAP_EML_PADDING_DELAY 0\n#define IEEE80211_EML_CAP_EML_TRANSITION_DELAY 0'
             nan_uapi='NL80211_IFTYPE_NAN_DATA'
             cfg_nan=$'CFG80211_NAN_SCHED_NUM_TIME_SLOTS\nCFG80211_NAN_MAX_PEER_MAPS'
-            mac_nan=$'BSS_CHANGED_NAN_LOCAL_SCHED\nnan_peer_sched_changed\nieee80211_nan_sched_update_done'
+            mac_nan=$'BSS_CHANGED_NAN_LOCAL_SCHED\nnan_peer_sched_changed\nieee80211_nan_sched_update_done\nieee80211_nan_cluster_joined'
             aql_decl='void ieee80211_txq_aql_pending(void);'
             ;;
         current)
@@ -58,7 +58,7 @@ make_fixture() {
             eml_symbols=$'#define IEEE80211_EML_CAP_EML_PADDING_DELAY 0\n#define IEEE80211_EML_CAP_EML_TRANSITION_DELAY 0'
             nan_uapi='NL80211_IFTYPE_NAN_DATA'
             cfg_nan=$'CFG80211_NAN_SCHED_NUM_TIME_SLOTS\nCFG80211_NAN_MAX_PEER_MAPS'
-            mac_nan=$'BSS_CHANGED_NAN_LOCAL_SCHED\nnan_peer_sched_changed\nieee80211_nan_sched_update_done'
+            mac_nan=$'BSS_CHANGED_NAN_LOCAL_SCHED\nnan_peer_sched_changed\nieee80211_nan_sched_update_done\nieee80211_nan_cluster_joined'
             aql_decl='void ieee80211_txq_aql_pending(void);'
             aql_export='0x0 ieee80211_txq_aql_pending mac80211 EXPORT_SYMBOL_GPL'
             ;;
@@ -97,6 +97,7 @@ assert_aql_without_symvers() {
     printf '%s\n' \
         '#define IEEE80211_EML_CAP_EML_PADDING_DELAY 0' \
         '#define IEEE80211_EML_CAP_EML_TRANSITION_DELAY 0' > "$kdir/include/linux/ieee80211-eht.h"
+    printf '%s\n' 'ieee80211_nan_cluster_joined' >> "$kdir/include/net/mac80211.h"
     rm "$kdir/Module.symvers"
 
     if ! actual=$("$COMPAT" detect "$kdir" 2> "$stderr"); then
@@ -122,10 +123,24 @@ assert_unsupported() {
 copy_wireless_next_tree() {
     local remote_head source_file
     local -a source_files=(
+        drivers/net/wireless/mediatek/mt76/mac80211.c
+        drivers/net/wireless/mediatek/mt76/mt76.h
         drivers/net/wireless/mediatek/mt76/mt76_connac_mac.c
+        drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.c
+        drivers/net/wireless/mediatek/mt76/mt76_connac_mcu.h
+        drivers/net/wireless/mediatek/mt76/mt7925/Makefile
+        drivers/net/wireless/mediatek/mt76/mt7925/init.c
         drivers/net/wireless/mediatek/mt76/mt7925/mac.c
+        drivers/net/wireless/mediatek/mt76/mt7925/main.c
         drivers/net/wireless/mediatek/mt76/mt7925/mcu.c
+        drivers/net/wireless/mediatek/mt76/mt7925/nan.c
+        drivers/net/wireless/mediatek/mt76/mt7925/nan.h
+        drivers/net/wireless/mediatek/mt76/mt7925/regd.c
+        drivers/net/wireless/mediatek/mt76/mt7925/regd.h
+        drivers/net/wireless/mediatek/mt76/mt792x.h
+        drivers/net/wireless/mediatek/mt76/mt792x_core.c
         drivers/net/wireless/mediatek/mt76/mt7996/mac.c
+        drivers/net/wireless/mediatek/mt76/tx.c
     )
 
     remote_head=$(git ls-remote "$WIRELESS_NEXT_REPO" refs/heads/main)
@@ -233,11 +248,59 @@ assert_applied_patches() {
             "$SOURCE_DIR/drivers/net/wireless/mediatek/mt76/mt7925/mcu.c" ||
             fail 'unselected EML patch changed the transition-delay name'
     fi
+
+    if [[ $action_generation == current && $eml_generation == current ]]; then
+        git -C "$SOURCE_DIR" diff --quiet ||
+            fail 'current fixture changed the wireless-next source'
+    fi
+}
+
+assert_v7_0_patch_scope() {
+    local kdir actual mt76_dir
+
+    reset_source
+    kdir=$(make_fixture v7.0)
+    actual=$("$COMPAT" apply "$SOURCE_DIR" "$kdir")
+    [[ $actual == $'action-frame\neml\nnan\naql' ]] ||
+        fail "v7.0: expected all compatibility patches, got $(printf '%q' "$actual")"
+
+    mt76_dir="$SOURCE_DIR/drivers/net/wireless/mediatek/mt76"
+    if grep -Rqs 'NL80211_IFTYPE_NAN_DATA' \
+        "$mt76_dir/mt7925" "$mt76_dir/mt792x.h" \
+        "$mt76_dir/mt792x_core.c" "$mt76_dir/mt76_connac_mcu.c"; then
+        fail 'NAN host references remain after v7.0 patch selection'
+    fi
+    grep -q 'nan.o' "$mt76_dir/mt7925/Makefile" &&
+        fail 'nan.o remains enabled after v7.0 patch selection'
+    grep -q 'ieee80211_txq_aql_pending' "$mt76_dir/tx.c" &&
+        fail 'AQL helper remains after v7.0 patch selection'
+    grep -Fq 'if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))' "$mt76_dir/tx.c" ||
+        fail 'legacy power-save guard is missing after v7.0 patch selection'
+}
+
+assert_failed_preflight_is_atomic() {
+    local kdir output makefile content changed_files
+    local context='obj-$(CONFIG_MT7925E) += mt7925e.o'
+    local makefile_path='drivers/net/wireless/mediatek/mt76/mt7925/Makefile'
+
+    reset_source
+    kdir=$(make_fixture v7.0)
+    makefile="$SOURCE_DIR/$makefile_path"
+    content=$(<"$makefile")
+    [[ $content == *"$context"* ]] || fail 'NAN mutation context is missing'
+    printf '%s\n' "${content/"$context"/"$context # mutated"}" > "$makefile"
+
+    if output=$("$COMPAT" apply "$SOURCE_DIR" "$kdir" 2>&1); then
+        fail 'mutated NAN context was accepted'
+    fi
+    changed_files=$(git -C "$SOURCE_DIR" diff --name-only)
+    [[ $changed_files == "$makefile_path" ]] ||
+        fail "failed preflight changed source files: $(printf '%q' "$changed_files")"
 }
 
 assert_patches v6.18 $'action-frame\neml\nnan\naql'
 assert_patches v7.0 $'action-frame\neml\nnan\naql'
-assert_patches v7.1 $'eml\naql'
+assert_patches v7.1 $'eml\nnan\naql'
 assert_patches v7.2 $'aql'
 assert_patches current ''
 assert_aql_without_symvers
@@ -247,6 +310,8 @@ assert_unsupported include/linux/ieee80211-eht.h '#define IEEE80211_EML_CAP_UNKN
 
 copy_wireless_next_tree
 assert_action_patch_scope
+assert_v7_0_patch_scope
+assert_failed_preflight_is_atomic
 assert_applied_patches legacy legacy $'action-frame\neml'
 assert_applied_patches legacy current 'action-frame'
 assert_applied_patches current legacy 'eml'

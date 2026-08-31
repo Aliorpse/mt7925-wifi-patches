@@ -45,7 +45,8 @@ detect_patches() {
        ! grep -q 'CFG80211_NAN_MAX_PEER_MAPS' "$cfg80211" ||
        ! grep -q 'BSS_CHANGED_NAN_LOCAL_SCHED' "$mac80211" ||
        ! grep -q 'nan_peer_sched_changed' "$mac80211" ||
-       ! grep -q 'ieee80211_nan_sched_update_done' "$mac80211"; then
+       ! grep -q 'ieee80211_nan_sched_update_done' "$mac80211" ||
+       ! grep -q 'ieee80211_nan_cluster_joined' "$mac80211"; then
         printf '%s\n' nan
     fi
 
