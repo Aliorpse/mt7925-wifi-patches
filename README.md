@@ -1,197 +1,250 @@
-# MT7925 WiFi Fix for Linux (ASUS ROG Flow Z13 2025 & More)
+# MT7925 PCIe Driver Overlay
 
-> **Fix WiFi disconnects, slow speeds, and instability on MediaTek MT7925 (Filogic 360) WiFi 7 chips — tested on ASUS ROG Flow Z13 2025**
+This repository builds the MT7925 PCIe driver from the current
+`wireless-next` development tree for the running Linux kernel. It installs five
+external modules without changing distribution-owned module files:
 
-## What This Does
+- `mt76`
+- `mt76_connac_lib`
+- `mt792x_lib`
+- `mt7925_common`
+- `mt7925e`
 
-This tool **automatically downloads, builds, and installs the latest WiFi drivers** for the MediaTek MT7925 chip from the Linux kernel's development tree (`wireless-next`). These drivers contain stability fixes that haven't reached stable kernels yet.
+The source moves with `wireless-next/main`. A build that succeeds today can fail
+after upstream changes. Each run prints the exact 40-character source SHA,
+compiler, and selected compatibility patch IDs; include those values with any
+failure report.
 
-**One command to fix your WiFi:**
-```bash
-sudo ./mt76-rebuild.sh
-```
+## Tested Scope
 
-No manual patching, no kernel recompilation — just run the script and reboot.
+CI tests these kernel API combinations against one resolved wireless-next SHA:
 
-## Features
+| Target kernel source | Toolchain | CI evidence |
+| --- | --- | --- |
+| Linux 6.18 | GCC | API compile check |
+| Linux 7.0 | GCC | API compile check |
+| Linux 7.1 | GCC | API compile check |
+| Linux 7.2 | GCC | API compile check |
+| Linux 7.1 | Clang with `LLVM=1` | API compile check |
 
-| Feature | Description |
-|---------|-------------|
-| 🔧 **One-Command Rebuild** | Single script downloads, builds, and installs everything |
-| ⚡ **ASPM Disabled** | Disables PCIe power management to prevent disconnects |
-| 🔋 **Power Save Disabled** | Disables WiFi power save to prevent latency issues |
-| 🔔 **Desktop Notifications** | Get notified on login with driver, ASPM, and power save status |
-| 📱 **App Launcher Integration** | Check patch status from KDE/GNOME app menu |
-| 💾 **Auto Backup** | Original drivers backed up automatically for easy restore |
-| 🔄 **Auto Update** | Script pulls latest fixes from wireless-next before building |
-| ↩️ **Easy Revert** | One command to restore original Fedora drivers |
-| 🐧 **Multi-Distro** | Works on Fedora, Ubuntu, Arch, and more |
+Source-tag jobs use `modules_prepare` and permit unresolved base-kernel symbols,
+so they test API compatibility, not whether a module can be loaded. A separate
+CI job builds against the GitHub runner's packaged headers and real
+`Module.symvers` with strict modpost, dependency, and vermagic checks. This
+matrix does not certify other kernel configurations, distributions, or devices.
+The weekly CI run is the moving-HEAD canary.
 
-## Symptoms This Fixes
+## Requirements
 
-- ❌ WiFi randomly disconnects
-- ❌ Slow WiFi speeds
-- ❌ WiFi won't connect after sleep/suspend
-- ❌ Connection drops under load
-- ❌ "No Wi-Fi adapter found" after kernel update
-- ❌ High latency / ping spikes
+Install headers that exactly match `uname -r`, plus the normal kernel module
+build tools.
 
-## Supported Devices
-
-Originally built for **ASUS ROG Flow Z13 (2025)** but works on any laptop with the MT7925 chip:
-
-| Device | Chip | Status |
-|--------|------|--------|
-| **ASUS ROG Flow Z13 (2025)** | MT7925 | ✅ **Tested & Working** |
-| ASUS ROG Zephyrus G14/G16 (2024+) | MT7925 | Should work |
-| ASUS Zenbook / Vivobook (2024+) | MT7925 | Should work |
-| Laptops with MediaTek RZ738 | MT7925 | Should work |
-| Any device with MT7925 WiFi 7 | MT7925 | Should work |
-
-**Have a different device?** Open an issue to add it to the list!
-
-> 💡 **ASUS ROG Flow Z13 2025 users:** This fix was specifically developed and tested on your device. It fixes the WiFi instability issues on Linux.
-
-## Supported Distros
-
-Works on any Linux distro with kernel 6.x+:
-- Fedora 39+ ✅ (tested on Fedora 43)
-- Ubuntu 24.04+
-- Arch Linux
-- openSUSE Tumbleweed
-- Debian Testing/Unstable
-- Pop!_OS
-- Linux Mint
-
-## Quick Start
+Fedora:
 
 ```bash
-# Clone this repo
-git clone https://github.com/burakgon/mt7925-wifi-patches.git
-cd mt7925-wifi-patches
-
-# Install dependencies (pick your distro)
-# Fedora:
-sudo dnf install kernel-devel kernel-headers gcc make git
-
-# Ubuntu/Debian:
-sudo apt install linux-headers-$(uname -r) build-essential git
-
-# Arch:
-sudo pacman -S linux-headers base-devel git
-
-# Run the rebuild script
-sudo ./mt76-rebuild.sh
+sudo dnf install "kernel-devel-$(uname -r)" gcc make git bc bison flex \
+  elfutils-libelf-devel openssl-devel kmod file iw
 ```
 
-## After Kernel Updates
-
-Rebuild the driver after each kernel update:
+Ubuntu:
 
 ```bash
-cd mt7925-wifi-patches
-sudo ./mt76-rebuild.sh
+sudo apt update
+sudo apt install "linux-headers-$(uname -r)" build-essential git bc bison flex \
+  libelf-dev libssl-dev kmod file iw
 ```
 
-## Desktop Notifications (Optional)
-
-Get notified when patches need to be reapplied:
+Arch Linux package names must match the installed kernel flavor. Use
+`linux-headers` for `linux`, `linux-lts-headers` for `linux-lts`, or
+`linux-zen-headers` for `linux-zen`:
 
 ```bash
-# Autostart on login (KDE/GNOME/XFCE)
-mkdir -p ~/.config/autostart
-cp mt76-check.desktop ~/.config/autostart/
-
-# Add to app launcher
-mkdir -p ~/.local/share/applications
-cp mt76-status.desktop ~/.local/share/applications/
+sudo pacman -S --needed base-devel git bc bison flex openssl libelf kmod file \
+  iw linux-headers
 ```
 
-## How It Works
+For a Clang build, also install Clang, LLVM, and LLD with the distribution
+package manager, then set `LLVM=1` when rebuilding.
 
-1. Downloads the `wireless-next` kernel tree (latest WiFi driver development)
-2. Builds mt76 driver modules for your kernel
-3. Replaces stock modules with patched versions
-4. Backs up original modules for easy restore
-5. Disables ASPM (PCIe power management) for stability
-6. Disables WiFi power save to prevent latency issues
+## Build And Install
 
-## Stability Settings
-
-The script automatically configures these settings to prevent common issues:
-
-| Setting | File | Purpose |
-|---------|------|---------|
-| **ASPM Disabled** | `/etc/modprobe.d/mt7925.conf` | Prevents random disconnects and freezes |
-| **Power Save Off** | NetworkManager dispatcher script | Prevents latency spikes and connection drops |
-
-## Verify It's Working
+Run the orchestrator as your normal user, without whole-script privilege:
 
 ```bash
-# Check modules are loaded
-lsmod | grep mt79
-
-# Check custom marker exists
-ls /lib/modules/$(uname -r)/kernel/drivers/net/wireless/mediatek/mt76/.custom-mt76
+./mt76-rebuild.sh
 ```
 
-## Restore Stock Drivers
-
-To undo all changes and restore original drivers:
+For Clang:
 
 ```bash
-cd mt7925-wifi-patches
-sudo ./mt76-revert.sh
+LLVM=1 ./mt76-rebuild.sh
 ```
 
-This removes custom modules, ASPM config, power save script, and restores original drivers.
+The script fetches and cleans the current `wireless-next/main`, feature-probes
+the target headers, applies only the required action-frame, EML, NAN, and AQL
+compatibility patches, and builds only the five modules listed above. Unknown
+header or source shapes stop before installation.
 
-## Troubleshooting
+The privileged helper installs the staged modules at:
 
-**Build fails with "kernel headers not found"**
+```text
+/lib/modules/$(uname -r)/updates/mt7925-wifi-patches/
+```
+
+It unloads the active stack, swaps the external overlay transactionally, runs
+`depmod`, verifies that all five module names resolve to the new path, reloads
+`mt7925e`, and verifies the loaded dependency stack. A failed transaction
+automatically returns to the previous overlay or the distribution modules and
+reports any recovery verification problem. Files below the kernel package's
+`kernel/` directory remain unchanged.
+
+Rebuild after booting each new kernel because overlays are scoped by
+`uname -r`.
+
+## Secure Boot And Signing
+
+The rebuild does not create or enroll a signing key. If module signature
+enforcement or kernel lockdown is active, it checks every built module's signer
+and refuses unsigned output before installation.
+
+Use a reviewed manual signing flow with a key enrolled for the machine. The
+kernel documentation describes `scripts/sign-file`, key formats, and signing
+configuration: [Kernel module signing facility](https://docs.kernel.org/admin-guide/module-signing.html).
+This repository does not automate that security-sensitive workflow.
+
+## Optional Stability Settings
+
+No power setting changes by default. They are explicit rebuild options:
+
 ```bash
-# Fedora
-sudo dnf install kernel-devel-$(uname -r)
-
-# Ubuntu
-sudo apt install linux-headers-$(uname -r)
+./mt76-rebuild.sh --disable-aspm
+./mt76-rebuild.sh --disable-power-save
+./mt76-rebuild.sh --disable-aspm --disable-power-save
 ```
 
-**Build fails around `IEEE80211_MIN_ACTION_SIZE` or `action_code`**
+`--disable-aspm` installs a project-owned `mt7925e disable_aspm=1` modprobe
+configuration. It can reduce PCIe power-management problems at the cost of
+higher power use.
 
-This means the latest `wireless-next` source uses a newer action-frame API
-than the installed kernel headers. The rebuild script detects the older API
-and applies the included compatibility patch automatically. Update this
-repository and rerun the script:
+`--disable-power-save` installs a NetworkManager dispatcher that turns power
+save off only for a managed interface bound to `mt7925e`. It can reduce latency
+at the cost of battery life.
+
+The installer refuses to replace a user-owned file at either target path.
+Revert removes only an exact project-generated setting; a locally changed file
+is preserved for manual review.
+
+## Firmware
+
+The build does not install firmware. Keep MediaTek firmware current through the
+distribution package manager and reboot if that package changes.
+
+Fedora:
 
 ```bash
-git pull --ff-only
-sudo ./mt76-rebuild.sh
+rpm -q linux-firmware
+sudo dnf upgrade linux-firmware
 ```
 
-If the script reports that the compatibility patch no longer applies, open an
-issue and include the full build output and `uname -r` result. Do not continue
-to the install step with partially built modules.
+Ubuntu:
 
-**WiFi still not working after install**
-- Reboot your system
-- Check `dmesg | grep mt79` for errors
-- Open an issue with your logs
+```bash
+dpkg-query -W linux-firmware
+sudo apt update
+sudo apt install --only-upgrade linux-firmware
+```
 
-## Related Links
+Debian:
 
-- [wireless-next tree](https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git/)
-- [OpenWrt mt76 driver](https://github.com/openwrt/mt76)
-- [Linux Wireless](https://wireless.wiki.kernel.org/)
+```bash
+dpkg-query -W firmware-mediatek
+sudo apt update
+sudo apt install --only-upgrade firmware-mediatek
+```
 
-## Contributing
+Arch Linux:
 
-Found a fix? Have a different device working? PRs and issues welcome!
+```bash
+pacman -Q linux-firmware
+sudo pacman -Syu linux-firmware
+```
+
+The MT7925 firmware files normally live under
+`/lib/firmware/mediatek/mt7925/`.
+
+## Status
+
+Use deterministic terminal output for troubleshooting:
+
+```bash
+./mt76-check.sh --text
+```
+
+Exit status `0` means the custom `mt7925e` resolves from this project's overlay
+and is loaded. Other states report stock resolution, an installed but unloaded
+driver, stale or incomplete build metadata, or an unknown module path.
+
+Inspect the real path selected by kmod for every module:
+
+```bash
+for module in mt76 mt76_connac_lib mt792x_lib mt7925_common mt7925e; do
+  modinfo -n "$module"
+done
+```
+
+With the custom stack installed, each path must be under the current kernel's
+`updates/mt7925-wifi-patches/` directory.
+
+## Revert
+
+Run the portable wrapper from a normal shell:
+
+```bash
+./mt76-revert.sh
+```
+
+Use `./mt76-revert.sh --yes` for non-interactive confirmation. The helper
+removes the current kernel's external overlay, runs `depmod`, verifies stock
+resolution for all five modules, reloads `mt7925e`, and verifies the loaded
+stack. It also removes unchanged project-generated optional settings while
+preserving user-owned files.
+
+## Desktop Status
+
+The desktop entries use `Exec=mt76-check.sh`, so install the executable in the
+user's `PATH` before installing either entry:
+
+```bash
+install -Dm755 mt76-check.sh "$HOME/.local/bin/mt76-check.sh"
+install -Dm644 mt76-check.desktop \
+  "$HOME/.config/autostart/mt76-check.desktop"
+install -Dm644 mt76-status.desktop \
+  "$HOME/.local/share/applications/mt76-status.desktop"
+```
+
+Confirm that `~/.local/bin` is in the graphical session's `PATH`. The checker
+uses `notify-send` when available and otherwise prints the same status text.
+
+Remove the entries with:
+
+```bash
+rm -f "$HOME/.config/autostart/mt76-check.desktop"
+rm -f "$HOME/.local/share/applications/mt76-status.desktop"
+rm -f "$HOME/.local/bin/mt76-check.sh"
+```
+
+## Development Checks
+
+```bash
+bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
+./tests/test-compat.sh
+./tests/test-rebuild.sh
+./tests/test-module-overlay.sh
+./tests/test-status.sh
+desktop-file-validate mt76-check.desktop mt76-status.desktop
+git diff --check
+```
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) file.
-
----
-
-**Keywords:** MT7925 Linux driver, MediaTek WiFi fix, Filogic 360 Linux, WiFi 7 Linux, mt76 driver, ASUS ROG WiFi fix, Linux WiFi disconnects, RZ738 Linux, WiFi not working Linux, kernel WiFi patch, ASUS ROG Flow Z13 2025 Linux, Z13 WiFi fix, ASUS Z13 2025 WiFi not working, ROG Flow Z13 Linux WiFi, ASUS Z13 Fedora WiFi, ASUS Z13 Ubuntu WiFi, ASUS Z13 Arch Linux
+MIT License. See [LICENSE](LICENSE).

@@ -1,4 +1,4 @@
-name: Compatibility patch
+name: Compatibility matrix
 
 on:
   pull_request:
@@ -12,26 +12,281 @@ on:
 permissions:
   contents: read
 
+env:
+  WIRELESS_NEXT_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git
+
 jobs:
-  test:
+  resolve-source:
+    name: Resolve wireless-next source
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      wireless_sha: ${{ steps.resolve.outputs.wireless_sha }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - name: Resolve wireless-next main once
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r wireless_sha ref < <(
+            git ls-remote --exit-code "$WIRELESS_NEXT_REPO" refs/heads/main
+          )
+          [[ $wireless_sha =~ ^[0-9a-f]{40}$ ]]
+          [[ $ref == refs/heads/main ]]
+          printf 'wireless_sha=%s\n' "$wireless_sha" >> "$GITHUB_OUTPUT"
+          printf 'wireless-next main resolves to %s.\n' "$wireless_sha"
 
-      - name: Validate compatibility patch
-        run: ./tests/test-compat-patch.sh
-
-  legacy-kernel-build:
+  static-tests:
+    name: Shell and desktop tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      - name: Install kernel build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes bc bison flex libelf-dev libssl-dev
+      - name: Install test and desktop tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes curl desktop-file-utils git
 
-      - name: Build against Linux 7.0 headers
-        run: ./tests/build-legacy-kernel.sh
+      - name: Check shell syntax
+        run: bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
+
+      - name: Test compatibility selection
+        run: ./tests/test-compat.sh
+
+      - name: Test normal-user rebuild flow
+        run: ./tests/test-rebuild.sh
+
+      - name: Test transactional module overlay
+        run: ./tests/test-module-overlay.sh
+
+      - name: Test status reporting
+        run: ./tests/test-status.sh
+
+      - name: Validate desktop entries
+        run: desktop-file-validate mt76-check.desktop mt76-status.desktop
+
+  api-build:
+    name: API compile (${{ matrix.kernel }}, ${{ matrix.toolchain }})
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel: v6.18
+            toolchain: gcc
+            patches: action-frame,eml,nan,aql
+          - kernel: v7.0
+            toolchain: gcc
+            patches: action-frame,eml,nan,aql
+          - kernel: v7.1
+            toolchain: gcc
+            patches: eml,nan,aql
+          - kernel: v7.2
+            toolchain: gcc
+            patches: aql
+          - kernel: v7.1
+            toolchain: llvm
+            patches: eml,nan,aql
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install GCC, LLVM, and kernel build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            bc \
+            bison \
+            build-essential \
+            clang \
+            dwarves \
+            file \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            llvm
+
+      - name: Build API-only source-tag check
+        shell: bash
+        env:
+          EXPECTED_PATCHES: ${{ matrix.patches }}
+          KERNEL_REF: ${{ matrix.kernel }}
+          TOOLCHAIN: ${{ matrix.toolchain }}
+          WIRELESS_NEXT_REF: ${{ needs.resolve-source.outputs.wireless_sha }}
+        run: |
+          set -euo pipefail
+          if [[ $TOOLCHAIN == llvm ]]; then
+            export LLVM=1
+            compiler_command=clang
+          else
+            unset LLVM
+            compiler_command=gcc
+          fi
+          compiler=$($compiler_command --version)
+          compiler=${compiler%%$'\n'*}
+
+          printf 'Kernel ref: %s\n' "$KERNEL_REF"
+          printf 'Compiler: %s\n' "$compiler"
+          printf 'Source SHA: %s\n' "$WIRELESS_NEXT_REF"
+          printf '%s\n' 'Build mode: API-only; unresolved base-kernel symbols are warnings.'
+
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          set +e
+          ./tests/build-legacy-kernel.sh 2>&1 | tee "$log"
+          build_status=${PIPESTATUS[0]}
+          set -e
+
+          if grep -Fqx 'Compatibility patches:' "$log"; then
+            patch_ids=$(awk '
+              /^Compatibility patches:$/ { capture = 1; next }
+              /^API compile check:/ { capture = 0 }
+              capture && NF { print }
+            ' "$log")
+            patch_csv=${patch_ids//$'\n'/,}
+            [[ -n $patch_csv ]] || patch_csv=none
+
+            feature_state() {
+              if grep -Fqx "$1" <<< "$patch_ids"; then
+                printf compat
+              else
+                printf native
+              fi
+            }
+            detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
+              "$(feature_state action-frame)" \
+              "$(feature_state eml)" \
+              "$(feature_state nan)" \
+              "$(feature_state aql)")
+          else
+            detected_features=unavailable
+            patch_csv=unavailable
+          fi
+
+          printf 'Detected features: %s\n' "$detected_features"
+          printf 'Patch IDs: %s\n' "$patch_csv"
+          ((build_status == 0)) || exit "$build_status"
+          grep -Fqx "wireless-next $WIRELESS_NEXT_REF resolves to $WIRELESS_NEXT_REF." "$log"
+          [[ $patch_csv == "$EXPECTED_PATCHES" ]]
+
+  strict-packaged-header-build:
+    name: Strict packaged-runner-header build
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install packaged headers and kernel build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            bc \
+            bison \
+            build-essential \
+            dwarves \
+            file \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libssl-dev \
+            "linux-headers-$(uname -r)"
+
+      - name: Build with strict modpost and real Module.symvers
+        shell: bash
+        env:
+          WIRELESS_NEXT_REF: ${{ needs.resolve-source.outputs.wireless_sha }}
+        run: |
+          set -euo pipefail
+          kver=$(uname -r)
+          kdir=$(realpath "/lib/modules/$kver/build")
+          symvers="$kdir/Module.symvers"
+          [[ -s $symvers ]]
+          header_owner=$(dpkg-query -S "$symvers")
+          header_owner=${header_owner%%:*}
+
+          source_dir="$RUNNER_TEMP/wireless-next-strict"
+          git init --quiet "$source_dir"
+          git -C "$source_dir" fetch --depth=1 \
+            "$WIRELESS_NEXT_REPO" "$WIRELESS_NEXT_REF"
+          git -C "$source_dir" checkout --quiet --detach FETCH_HEAD
+          source_sha=$(git -C "$source_dir" rev-parse HEAD)
+          [[ $source_sha == "$WIRELESS_NEXT_REF" ]]
+
+          compiler=$(gcc --version)
+          compiler=${compiler%%$'\n'*}
+          patch_ids=$(./scripts/compat.sh detect "$kdir")
+          patch_csv=${patch_ids//$'\n'/,}
+          [[ -n $patch_csv ]] || patch_csv=none
+
+          feature_state() {
+            if grep -Fqx "$1" <<< "$patch_ids"; then
+              printf compat
+            else
+              printf native
+            fi
+          }
+          detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
+            "$(feature_state action-frame)" \
+            "$(feature_state eml)" \
+            "$(feature_state nan)" \
+            "$(feature_state aql)")
+
+          printf 'Kernel ref: packaged %s (%s)\n' "$kver" "$header_owner"
+          printf 'Compiler: %s\n' "$compiler"
+          printf 'Source SHA: %s\n' "$source_sha"
+          printf 'Detected features: %s\n' "$detected_features"
+          printf 'Patch IDs: %s\n' "$patch_csv"
+          printf 'Module.symvers: %s\n' "$symvers"
+          printf '%s\n' 'Build mode: strict modpost; unresolved symbols are errors.'
+
+          applied=$(./scripts/compat.sh apply "$source_dir" "$kdir")
+          [[ $applied == "$patch_ids" ]]
+
+          mt76_dir="$source_dir/drivers/net/wireless/mediatek/mt76"
+          make -C "$kdir" M="$mt76_dir" \
+            CONFIG_MT76_CORE=m \
+            CONFIG_MT76_USB=n \
+            CONFIG_MT76_SDIO=n \
+            CONFIG_MT76x02_LIB=n \
+            CONFIG_MT76x02_USB=n \
+            CONFIG_MT76_CONNAC_LIB=m \
+            CONFIG_MT792x_LIB=m \
+            CONFIG_MT792x_USB=n \
+            CONFIG_MT76_NPU= \
+            CONFIG_MT76x0_COMMON=n \
+            CONFIG_MT76x2_COMMON=n \
+            CONFIG_MT7603E=n \
+            CONFIG_MT7615_COMMON=n \
+            CONFIG_MT7915E=n \
+            CONFIG_MT7921_COMMON=n \
+            CONFIG_MT7996E=n \
+            CONFIG_MT7925_COMMON=m \
+            CONFIG_MT7925E=m \
+            CONFIG_MT7925U=n \
+            modules -j"$(nproc)"
+
+          modules=(
+            "$mt76_dir/mt76.ko"
+            "$mt76_dir/mt76-connac-lib.ko"
+            "$mt76_dir/mt792x-lib.ko"
+            "$mt76_dir/mt7925/mt7925-common.ko"
+            "$mt76_dir/mt7925/mt7925e.ko"
+          )
+          for module in "${modules[@]}"; do
+            [[ -s $module ]]
+            vermagic=$(modinfo -F vermagic "$module")
+            [[ $vermagic == "$kver"* ]]
+            depends=$(modinfo -F depends "$module")
+            printf 'Module: %s; vermagic: %s; depends: %s\n' \
+              "${module##*/}" "$vermagic" "$depends"
+          done

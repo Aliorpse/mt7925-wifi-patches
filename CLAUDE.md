@@ -1,165 +1,166 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file defines the maintainer contract for this repository.
 
-## Purpose
+## Scope
 
-This project builds and installs custom mt76 WiFi drivers from the wireless-next kernel tree for the MediaTek MT7925 chip. The stock Fedora kernel drivers have stability issues.
+The project builds the MT7925 PCIe driver from `wireless-next` as exactly five
+external modules: `mt76`, `mt76_connac_lib`, `mt792x_lib`, `mt7925_common`, and
+`mt7925e`. Keep documentation and build selectors limited to that scope.
 
-## Rebuild After Kernel Update
+## Source And Compatibility Contract
 
-When the user gets a kernel update and needs to rebuild the driver:
+`mt76-rebuild.sh` fetches `wireless-next/main`, validates the resolved
+40-character SHA, resets the checkout to that revision, and cleans it before
+each build. Current HEAD is intentional and can break when upstream source
+changes. Never describe it as a stable source pin.
 
-```bash
-sudo ./mt76-rebuild.sh
-```
+`scripts/compat.sh` probes target headers and `Module.symvers` rather than
+selecting by release number. Its stdout is the stable patch-ID stream consumed
+by build metadata:
 
-That's it. The script handles everything: pulling updates, building, unloading old modules, installing new ones, and loading them.
+- `action-frame`
+- `eml`
+- `nan`
+- `aql`
 
-## Manual Steps (if rebuild script fails)
+Patch application is atomic: every selected patch passes `git apply --check`
+before source changes. Put compatibility changes in independently selectable
+files under `patches/`; do not tell users to edit the cleaned source checkout.
 
-1. **Update source:**
-   ```bash
-   git -C wireless-next pull
-   ```
+Expected source-tag API coverage:
 
-2. **Build:**
-   ```bash
-   KVER=$(uname -r)
-   SRC_DIR=$(pwd)/wireless-next/drivers/net/wireless/mediatek/mt76
-   make -C /lib/modules/$KVER/build M=$SRC_DIR clean
-   make -C /lib/modules/$KVER/build M=$SRC_DIR \
-       CONFIG_MT76_CORE=m \
-       CONFIG_MT76_CONNAC_LIB=m \
-       CONFIG_MT792x_LIB=m \
-       CONFIG_MT7925_COMMON=m \
-       CONFIG_MT7925E=m \
-       modules
-   ```
+| Headers | Selected compatibility |
+| --- | --- |
+| Linux 6.18 | action-frame, eml, nan, aql |
+| Linux 7.0 | action-frame, eml, nan, aql |
+| Linux 7.1 | eml, nan, aql |
+| Linux 7.2 | aql |
+| Current native API | none |
 
-3. **Install:**
-   ```bash
-   sudo modprobe -r mt7925e mt7925_common mt792x_lib mt76_connac_lib mt76
+Feature probes remain authoritative when a distribution backports APIs.
 
-   MOD_DIR=/lib/modules/$KVER/kernel/drivers/net/wireless/mediatek/mt76
-   sudo cp $SRC_DIR/mt76.ko $MOD_DIR/
-   sudo cp $SRC_DIR/mt76-connac-lib.ko $MOD_DIR/
-   sudo cp $SRC_DIR/mt792x-lib.ko $MOD_DIR/
-   sudo cp $SRC_DIR/mt7925/mt7925-common.ko $MOD_DIR/mt7925/
-   sudo cp $SRC_DIR/mt7925/mt7925e.ko $MOD_DIR/mt7925/
-   sudo touch $MOD_DIR/.custom-mt76
+## Rebuild Contract
 
-   sudo depmod -a
-   sudo modprobe mt7925e
-   ```
-
-## Revert to Original Drivers
-
-To undo all changes and restore original Fedora drivers:
+Run the script as a normal user:
 
 ```bash
-sudo ./mt76-revert.sh
+./mt76-rebuild.sh
 ```
 
-This removes custom modules, ASPM config, power save script, and restores original drivers.
+It must reject direct root execution, perform source and build work without
+privilege, print the running kernel, compiler, source SHA, and patch IDs, and
+invoke `sudo` only for `scripts/module-overlay.sh install`.
 
-## Key Files
-
-- `mt76-rebuild.sh` - One-command rebuild and install
-- `mt76-revert.sh` - Undo all changes, restore original drivers
-- `mt76-check.sh` - Shows notification with patch status
-- `wireless-next/` - Kernel source tree with mt76 driver (auto-downloaded)
-- `backup-modules/` - Backup of original Fedora modules
-
-## Stability Settings
-
-The rebuild script automatically configures these for stability:
-
-**ASPM Disabled** (`/etc/modprobe.d/mt7925.conf`):
-- Disables PCIe Active State Power Management
-- Prevents random disconnects and freezes
-
-**Power Save Disabled** (`/etc/NetworkManager/dispatcher.d/99-mt7925-powersave-off`):
-- Disables WiFi power save when interface comes up
-- Prevents latency spikes and connection drops
-
-## Hardware
-
-- Chip: MediaTek MT7925 (Filogic 360, WiFi 7)
-- Interface: PCIe (`mt7925e`)
-- Firmware: `/lib/firmware/mediatek/mt7925/`
-
-## Check for New OpenWrt Patches
-
-OpenWrt may have additional MT7925 fixes not yet in wireless-next. Check and apply if needed:
-
-1. **Check OpenWrt mt76 commits:**
-   ```bash
-   # Clone or update OpenWrt mt76 repo
-   if [[ -d openwrt-mt76 ]]; then
-       git -C openwrt-mt76 pull
-   else
-       git clone https://github.com/openwrt/mt76.git openwrt-mt76
-   fi
-
-   # Show recent MT7925-specific commits
-   git -C openwrt-mt76 log --oneline --grep="mt7925" -20
-   git -C openwrt-mt76 log --oneline -- mt7925/ | head -20
-   ```
-
-2. **Compare with wireless-next:**
-   ```bash
-   # Check wireless-next MT7925 commits
-   git -C wireless-next log --oneline -- drivers/net/wireless/mediatek/mt76/mt7925/ | head -20
-   ```
-
-3. **If OpenWrt has newer fixes**, check if they can be cherry-picked or manually applied to wireless-next source.
-
-**OpenWrt URLs:**
-- MT76 repo: https://github.com/openwrt/mt76
-- MT76 patches: https://github.com/openwrt/openwrt/tree/main/package/kernel/mt76/patches
-
-**Note:** OpenWrt's mt76 driver has diverged from mainline and may not compile directly against stock kernels. Cherry-pick specific commits or manually port fixes if needed.
-
-## Notification System
-
-Desktop notifications alert the user about patch status.
-
-**How it works:**
-- On login/reboot: `~/.config/autostart/mt76-check.desktop` runs `mt76-check.sh`
-- App launcher: "WiFi Patch Status" app also runs `mt76-check.sh`
-- The script checks if `/lib/modules/$(uname -r)/kernel/drivers/net/wireless/mediatek/mt76/.custom-mt76` marker file exists
-- Shows "✓ PATCHED" or "✗ NOT PATCHED" notification
-
-**Files:**
-- `mt76-check.sh` - Notification script
-- `~/.config/autostart/mt76-check.desktop` - Autostart entry (runs on login)
-- `~/.local/share/applications/mt76-status.desktop` - App launcher entry
-
-**To update notification text**, edit `mt76-check.sh`.
-
-**To disable autostart notification:**
-```bash
-rm ~/.config/autostart/mt76-check.desktop
-```
-
-**To remove app launcher entry:**
-```bash
-rm ~/.local/share/applications/mt76-status.desktop
-```
-
-## Checking Status
+For the supported Clang path:
 
 ```bash
-# Check if custom modules are loaded
-lsmod | grep mt79
-
-# Check module info
-modinfo mt76 | head -10
-
-# Check if custom marker exists
-ls -la /lib/modules/$(uname -r)/kernel/drivers/net/wireless/mediatek/mt76/.custom-mt76
-
-# Manually trigger notification
-./mt76-check.sh
+LLVM=1 ./mt76-rebuild.sh
 ```
+
+Preserve explicit Kbuild tool variables and the PCIe-only selectors. The build
+must produce and validate these files before privilege escalation:
+
+- `mt76.ko`
+- `mt76-connac-lib.ko`
+- `mt792x-lib.ko`
+- `mt7925-common.ko`
+- `mt7925e.ko`
+
+Each staged file must be non-empty ELF relocatable output with vermagic matching
+`uname -r`. `.build-info` contains `kernel`, `source_sha`, `compiler`, and
+comma-separated `patches`.
+
+When signature enforcement or lockdown is active, unsigned output must be
+refused before installation. There is no automatic key enrollment or signing
+flow. Refer users to the kernel's
+[module signing documentation](https://docs.kernel.org/admin-guide/module-signing.html)
+for a reviewed manual process.
+
+## Overlay And Revert Contract
+
+The privileged helper owns only the current kernel's external overlay:
+
+```text
+/lib/modules/$KVER/updates/mt7925-wifi-patches/
+```
+
+An install stages a new directory, unloads the five-module stack, atomically
+activates the new overlay, runs `depmod -a "$KVER"`, verifies all five `modinfo`
+resolutions, loads `mt7925e`, and verifies the complete loaded stack. A failed
+transaction returns to the previous overlay or stock resolution and reports
+recovery verification failures. Distribution-owned module files under
+`/lib/modules/$KVER/kernel/` are never installation targets.
+
+The user-facing revert is:
+
+```bash
+./mt76-revert.sh
+```
+
+`--yes` skips confirmation. Revert is scoped to `uname -r`, verifies stock
+resolution for all five modules, reloads the stack, and is repeatable.
+
+## Optional Settings Contract
+
+Power settings are opt-in only:
+
+- `--disable-aspm` manages
+  `/etc/modprobe.d/99-mt7925-wifi-patches.conf`.
+- `--disable-power-save` manages
+  `/etc/NetworkManager/dispatcher.d/99-mt7925-wifi-patches`.
+
+The dispatcher acts only on a NetworkManager-managed interface whose driver
+module resolves to `mt7925e`. Both options can increase power consumption.
+Refuse user-owned target files. Remove only byte-identical project-generated
+settings; preserve locally changed files and print manual recovery paths when a
+transaction cannot restore prior content.
+
+## Status And Desktop Contract
+
+`./mt76-check.sh --text` is deterministic and does not require a notifier. It
+uses `modinfo -n mt7925e`, overlay metadata, `/proc/modules`, and the canonical
+sysfs driver-module link. Exit `0` means the custom driver is loaded; stock,
+unloaded, stale, missing, and unknown states are nonzero.
+
+Desktop entries use `Exec=mt76-check.sh`. User instructions must install the
+checker first:
+
+```bash
+install -Dm755 mt76-check.sh "$HOME/.local/bin/mt76-check.sh"
+install -Dm644 mt76-check.desktop \
+  "$HOME/.config/autostart/mt76-check.desktop"
+install -Dm644 mt76-status.desktop \
+  "$HOME/.local/share/applications/mt76-status.desktop"
+```
+
+## Firmware Contract
+
+Firmware stays distribution-managed; the rebuild does not write under
+`/lib/firmware`. Keep README package commands specific to Fedora, Ubuntu,
+Debian, and Arch Linux.
+
+## CI And Verification
+
+CI resolves wireless-next HEAD once and passes that SHA to all five matrix
+entries: GCC on Linux 6.18, 7.0, 7.1, and 7.2, plus Clang/`LLVM=1` on Linux
+7.1. These source-tag jobs are API-only checks because `modules_prepare` lacks a
+complete `Module.symvers`. The separate packaged-runner-header job uses a real
+`Module.symvers` and strict modpost. Every build log must print the kernel ref,
+compiler, source SHA, detected feature states, and patch IDs.
+
+Run the full local suite after any behavioral, documentation, or workflow
+change:
+
+```bash
+bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
+./tests/test-compat.sh
+./tests/test-rebuild.sh
+./tests/test-module-overlay.sh
+./tests/test-status.sh
+desktop-file-validate mt76-check.desktop mt76-status.desktop
+git diff --check
+```
+
+Keep claims bounded by these checks. The API matrix is not evidence for every
+kernel configuration, distribution, device, or module load path.
