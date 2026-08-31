@@ -14,6 +14,8 @@ FAKE_BIN="$TEST_DIR/fake-bin"
 STAGES="$TEST_DIR/stages"
 OUTPUT="$TEST_DIR/output"
 COMMAND_LOG="$TEST_DIR/commands.log"
+MODINFO_LOG="$TEST_DIR/modinfo.log"
+DEPMOD_STATE="$TEST_DIR/depmod.state"
 IW_LOG="$TEST_DIR/iw.log"
 FAIL_MARKER="$TEST_DIR/fail-once"
 PACKAGE_SNAPSHOT="$TEST_DIR/package-snapshot"
@@ -46,6 +48,13 @@ assert_file_equals() {
     actual=$(<"$file")
     [[ $actual == "$expected" ]] ||
         fail "$file contained $(printf '%q' "$actual"), expected $(printf '%q' "$expected")"
+}
+
+assert_contains() {
+    local file=$1 expected=$2
+
+    grep -Fq -- "$expected" "$file" ||
+        fail "$file does not contain $(printf '%q' "$expected")"
 }
 
 module_file() {
@@ -109,10 +118,12 @@ make_stage() {
 
 reset_fixture() {
     rm -rf "$FAKE_ROOT" "$STAGES" "$PACKAGE_SNAPSHOT"
-    rm -f "$OUTPUT" "$COMMAND_LOG" "$IW_LOG" "$FAIL_MARKER" "$TEST_DIR/sudo.log"
+    rm -f "$OUTPUT" "$COMMAND_LOG" "$MODINFO_LOG" "$IW_LOG" "$FAIL_MARKER" "$TEST_DIR/sudo.log"
     mkdir -p "$STAGES" "$ETC_ROOT/modprobe.d" "$ETC_ROOT/NetworkManager/dispatcher.d"
     make_stock_kernel "$KVER"
     write_loaded_stack
+    : > "$MODINFO_LOG"
+    printf 'stock\n' > "$DEPMOD_STATE"
     "$REAL_CP" -R "$MODULES_ROOT/$KVER/kernel" "$PACKAGE_SNAPSHOT"
     FAIL_STAGE=''
 }
@@ -143,6 +154,17 @@ if [[ ${FAKE_FAIL_STAGE-} == settings && $destination == "$FAKE_DISPATCHER_TARGE
     printf 'fake settings activation failure\n' >&2
     exit 71
 fi
+if [[ ${FAKE_FAIL_STAGE-} == settings-restore ]]; then
+    source=$1
+    if [[ $source == */dispatcher.generated && $destination == "$FAKE_DISPATCHER_TARGET" ]]; then
+        printf 'fake settings activation failure\n' >&2
+        exit 71
+    fi
+    if [[ $source == */aspm.previous ]]; then
+        printf 'fake settings restore failure\n' >&2
+        exit 75
+    fi
+fi
 exec "$FAKE_REAL_MV" "$@"
 EOF
 
@@ -152,14 +174,29 @@ set -euo pipefail
 printf 'depmod %s\n' "$*" >> "$FAKE_COMMAND_LOG"
 [[ $# -eq 2 && $1 == -a && $2 == "$FAKE_KVER" ]] || exit 2
 active="$FAKE_MODULES_ROOT/$FAKE_KVER/updates/mt7925-wifi-patches/.build-info"
-if [[ ${FAKE_FAIL_STAGE-} == depmod && -f $active && ! -e $FAKE_FAIL_MARKER ]]; then
+resolution=stock
+if [[ -f $active ]]; then
+    build=''
+    while IFS= read -r line; do
+        [[ $line != build=* ]] || build=${line#build=}
+    done < "$active"
+    [[ -n $build ]] || exit 2
+    resolution="overlay:$build"
+fi
+if [[ ${FAKE_FAIL_STAGE-} =~ ^(depmod|rollback-resolution|rollback-stack)$ && -f $active && ! -e $FAKE_FAIL_MARKER ]]; then
     while IFS= read -r line; do
         if [[ $line == 'build=new' ]]; then
+            printf 'stale\n' > "$FAKE_DEPMOD_STATE"
             : > "$FAKE_FAIL_MARKER"
             printf 'fake depmod failure\n' >&2
             exit 72
         fi
     done < "$active"
+fi
+if [[ ${FAKE_FAIL_STAGE-} == rollback-resolution && -e $FAKE_FAIL_MARKER ]]; then
+    printf 'stale\n' > "$FAKE_DEPMOD_STATE"
+else
+    printf '%s\n' "$resolution" > "$FAKE_DEPMOD_STATE"
 fi
 EOF
 
@@ -168,6 +205,7 @@ EOF
 set -euo pipefail
 [[ $# -eq 4 && $1 == -k && $2 == "$FAKE_KVER" && $3 == -n ]] || exit 2
 module=$4
+printf '%s\n' "$module" >> "$FAKE_MODINFO_LOG"
 case $module in
     mt76) file=mt76.ko; stock=mt76.ko ;;
     mt76_connac_lib) file=mt76-connac-lib.ko; stock=mt76-connac-lib.ko ;;
@@ -178,6 +216,14 @@ case $module in
 esac
 active="$FAKE_MODULES_ROOT/$FAKE_KVER/updates/mt7925-wifi-patches"
 if [[ -f $active/$file ]]; then
+    build=''
+    while IFS= read -r line; do
+        [[ $line != build=* ]] || build=${line#build=}
+    done < "$active/.build-info"
+    if [[ $(<"$FAKE_DEPMOD_STATE") != "overlay:$build" ]]; then
+        printf '%s/stale/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER" "$file"
+        exit 0
+    fi
     if [[ ${FAKE_FAIL_STAGE-} == modinfo && $module == mt7925e ]]; then
         while IFS= read -r line; do
             [[ $line != 'build=new' ]] || {
@@ -188,6 +234,10 @@ if [[ -f $active/$file ]]; then
     fi
     printf '%s/%s\n' "$active" "$file"
 else
+    if [[ $(<"$FAKE_DEPMOD_STATE") != stock ]]; then
+        printf '%s/stale/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER" "$file"
+        exit 0
+    fi
     printf '%s/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER/kernel/drivers/net/wireless/mediatek/mt76" "$stock"
 fi
 EOF
@@ -221,6 +271,15 @@ PARTIAL
     : > "$FAKE_FAIL_MARKER"
     printf 'fake load failure\n' >&2
     exit 74
+fi
+if [[ ${FAKE_FAIL_STAGE-} == rollback-stack && -e $FAKE_FAIL_MARKER ]]; then
+    cat > "$FAKE_PROC_MODULES" <<'PARTIAL'
+mt76 1 0 - Live 0x0
+mt76_connac_lib 1 1 mt76, Live 0x0
+mt792x_lib 1 1 mt76_connac_lib, Live 0x0
+mt7925e 1 1 mt7925_common, Live 0x0
+PARTIAL
+    exit 0
 fi
 cat > "$FAKE_PROC_MODULES" <<'LOADED'
 mt76 1 0 - Live 0x0
@@ -275,6 +334,8 @@ run_overlay() {
         FAKE_MODULES_ROOT="$MODULES_ROOT" \
         FAKE_PROC_MODULES="$PROC_MODULES" \
         FAKE_COMMAND_LOG="$COMMAND_LOG" \
+        FAKE_MODINFO_LOG="$MODINFO_LOG" \
+        FAKE_DEPMOD_STATE="$DEPMOD_STATE" \
         FAKE_IW_LOG="$IW_LOG" \
         FAKE_FAIL_STAGE="$FAIL_STAGE" \
         FAKE_FAIL_MARKER="$FAIL_MARKER" \
@@ -315,6 +376,7 @@ assert_resolves_stock() {
     for module in mt76 mt76_connac_lib mt792x_lib mt7925_common mt7925e; do
         expected=$(stock_path "$KVER" "$module")
         actual=$(FAKE_MODULES_ROOT="$MODULES_ROOT" FAKE_KVER="$KVER" FAKE_FAIL_STAGE='' \
+            FAKE_MODINFO_LOG=/dev/null FAKE_DEPMOD_STATE="$DEPMOD_STATE" \
             "$FAKE_BIN/modinfo" -k "$KVER" -n "$module")
         [[ $actual == "$expected" ]] || fail "$module did not resolve to stock: $actual"
     done
@@ -327,9 +389,22 @@ assert_resolves_overlay() {
         file=$(module_file "$module")
         expected="$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches/$file"
         actual=$(FAKE_MODULES_ROOT="$MODULES_ROOT" FAKE_KVER="$KVER" FAKE_FAIL_STAGE='' \
+            FAKE_MODINFO_LOG=/dev/null FAKE_DEPMOD_STATE="$DEPMOD_STATE" \
             "$FAKE_BIN/modinfo" -k "$KVER" -n "$module")
         [[ $actual == "$expected" ]] || fail "$module did not resolve to overlay: $actual"
     done
+}
+
+assert_modinfo_calls() {
+    local expected_count=$1 count=0 module
+    local -a expected_modules=(mt76 mt76_connac_lib mt792x_lib mt7925_common mt7925e)
+
+    while IFS= read -r module; do
+        [[ $module == "${expected_modules[$((count % 5))]}" ]] ||
+            fail "unexpected modinfo call $((count + 1)): $module"
+        ((count += 1))
+    done < "$MODINFO_LOG"
+    [[ $count -eq $expected_count ]] || fail "expected $expected_count modinfo calls, got $count"
 }
 
 assert_overlay_tag() {
@@ -451,17 +526,49 @@ test_pre_activation_failures() {
 }
 
 test_stock_rollbacks() {
-    local stage failure
+    local stage failure expected_calls
 
     for failure in depmod modinfo load; do
         reset_fixture
         stage=$(make_stage "$failure" new)
         FAIL_STAGE=$failure
         run_overlay install "$stage" "$KVER" 0 0
+        if [[ $failure == depmod ]]; then
+            expected_calls=5
+        else
+            expected_calls=10
+        fi
+        assert_modinfo_calls "$expected_calls"
         assert_failed_install_is_stock
         assert_loaded_stack
     done
     pass 'depmod, resolution, and load failures roll back to stock'
+}
+
+test_rollback_verification_warnings() {
+    local stage failure
+
+    for failure in rollback-resolution rollback-stack; do
+        reset_fixture
+        stage=$(make_stage "$failure" new)
+        FAIL_STAGE=$failure
+        run_overlay install "$stage" "$KVER" 0 0
+        assert_failure
+        [[ $RUN_STATUS -eq 72 ]] || fail "rollback replaced original status 72 with $RUN_STATUS"
+        assert_modinfo_calls 5
+        if [[ $failure == rollback-resolution ]]; then
+            assert_contains "$OUTPUT" 'rollback module resolution verification failed'
+            assert_file_equals "$DEPMOD_STATE" 'stale'
+        else
+            assert_contains "$OUTPUT" 'rollback loaded module verification failed'
+            assert_file_equals "$DEPMOD_STATE" 'stock'
+        fi
+        [[ ! -e $MODULES_ROOT/$KVER/updates/mt7925-wifi-patches ]] ||
+            fail "$failure left a failed overlay active"
+        assert_no_transaction_siblings
+        assert_package_unchanged
+    done
+    pass 'rollback warns when restored resolution or loaded dependencies fail verification'
 }
 
 test_previous_overlay_and_settings_rollback() {
@@ -473,14 +580,14 @@ test_previous_overlay_and_settings_rollback() {
     assert_success
     config="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
     dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
-    printf '# previous local line\n' >> "$config"
-    printf '# previous local line\n' >> "$dispatcher"
     old_config=$(<"$config")
     old_dispatcher=$(<"$dispatcher")
 
+    : > "$MODINFO_LOG"
     new_stage=$(make_stage rollback new)
     FAIL_STAGE=settings
     run_overlay install "$new_stage" "$KVER" 1 1
+    assert_modinfo_calls 10
     assert_failure
     assert_overlay_tag old
     assert_resolves_overlay
@@ -490,6 +597,111 @@ test_previous_overlay_and_settings_rollback() {
     assert_file_equals "$dispatcher" "$old_dispatcher"
     assert_package_unchanged
     pass 'post-load settings failure restores previous overlay and settings'
+}
+
+test_failed_settings_restore_preserves_backup() {
+    local old_stage new_stage config dispatcher old_config old_dispatcher backup
+    local -a preserved=()
+
+    reset_fixture
+    old_stage=$(make_stage preserve-old old)
+    run_overlay install "$old_stage" "$KVER" 1 1
+    assert_success
+    config="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+    dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+    old_config=$(<"$config")
+    old_dispatcher=$(<"$dispatcher")
+
+    new_stage=$(make_stage preserve-new new)
+    FAIL_STAGE=settings-restore
+    run_overlay install "$new_stage" "$KVER" 1 1
+    assert_failure
+    [[ $RUN_STATUS -eq 71 ]] || fail "rollback replaced original status 71 with $RUN_STATUS"
+    assert_contains "$OUTPUT" 'backup preserved at '
+    assert_contains "$OUTPUT" 'restore it manually'
+
+    shopt -s nullglob
+    preserved=("$ETC_ROOT"/.mt7925-wifi-patches.*)
+    shopt -u nullglob
+    [[ ${#preserved[@]} -eq 1 ]] || fail "expected one preserved settings directory, got ${#preserved[@]}"
+    backup="${preserved[0]}/aspm.previous"
+    assert_file_equals "$backup" "$old_config"
+    assert_file_equals "$dispatcher" "$old_dispatcher"
+    assert_overlay_tag old
+    assert_resolves_overlay
+    assert_loaded_stack
+    assert_no_transaction_siblings
+    assert_package_unchanged
+    pass 'failed settings restore preserves byte-identical backup with recovery instructions'
+}
+
+test_exact_generated_settings_replace_and_revert() {
+    local old_stage new_stage config dispatcher
+
+    reset_fixture
+    config="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+    dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+    old_stage=$(make_stage exact-old old)
+    run_overlay install "$old_stage" "$KVER" 1 1
+    assert_success
+
+    new_stage=$(make_stage exact-new new)
+    run_overlay install "$new_stage" "$KVER" 1 1
+    assert_success
+    assert_overlay_tag new
+    assert_file_equals "$config" $'# Generated by mt7925-wifi-patches\noptions mt7925e disable_aspm=1'
+    [[ -x $dispatcher ]] || fail 'exact generated dispatcher was not replaced'
+
+    run_overlay revert "$KVER"
+    assert_success
+    [[ ! -e $config && ! -e $dispatcher ]] || fail 'revert left exact generated settings'
+    assert_resolves_stock
+    assert_loaded_stack
+    assert_package_unchanged
+    pass 'exact generated settings are replaceable and removable'
+}
+
+test_modified_generated_settings_are_user_owned() {
+    local modified old_stage new_stage config dispatcher modified_file other_file
+    local modified_before other_before
+
+    for modified in aspm dispatcher; do
+        reset_fixture
+        config="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+        dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+        old_stage=$(make_stage "modified-$modified-old" old)
+        run_overlay install "$old_stage" "$KVER" 1 1
+        assert_success
+
+        if [[ $modified == aspm ]]; then
+            modified_file=$config
+            other_file=$dispatcher
+        else
+            modified_file=$dispatcher
+            other_file=$config
+        fi
+        printf '# local modification\n' >> "$modified_file"
+        modified_before=$(<"$modified_file")
+        other_before=$(<"$other_file")
+
+        new_stage=$(make_stage "modified-$modified-new" new)
+        run_overlay install "$new_stage" "$KVER" 1 1
+        assert_failure
+        assert_overlay_tag old
+        assert_file_equals "$modified_file" "$modified_before"
+        assert_file_equals "$other_file" "$other_before"
+        assert_no_transaction_siblings
+        assert_package_unchanged
+
+        run_overlay revert "$KVER"
+        assert_success
+        assert_file_equals "$modified_file" "$modified_before"
+        [[ ! -e $other_file ]] || fail "revert preserved exact generated $other_file"
+        assert_resolves_stock
+        assert_loaded_stack
+        assert_package_unchanged
+    done
+    pass 'locally modified marked settings are refused and preserved as user-owned'
 }
 
 test_user_owned_settings() {
@@ -631,7 +843,11 @@ test_first_and_replacement_install
 test_other_kernel_untouched
 test_pre_activation_failures
 test_stock_rollbacks
+test_rollback_verification_warnings
 test_previous_overlay_and_settings_rollback
+test_failed_settings_restore_preserves_backup
+test_exact_generated_settings_replace_and_revert
+test_modified_generated_settings_are_user_owned
 test_user_owned_settings
 test_optional_settings_and_dispatcher_filter
 test_revert_and_repeated_revert

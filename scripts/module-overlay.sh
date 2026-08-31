@@ -27,14 +27,19 @@ ASPM_TARGET=''
 DISPATCHER_TARGET=''
 ASPM_DESIRED=''
 DISPATCHER_DESIRED=''
+ASPM_EXPECTED=''
+DISPATCHER_EXPECTED=''
 aspm_backed_up=0
 aspm_installed=0
 dispatcher_backed_up=0
 dispatcher_installed=0
+preserve_settings_tmp=0
 transaction_started=0
 previous_moved=0
 new_active=0
 committed=0
+RESOLUTION_ERROR=''
+LOADED_ERROR=''
 
 usage() {
     printf 'usage: %s install STAGE_DIR KVER DISABLE_ASPM DISABLE_POWER_SAVE\n' "${0##*/}" >&2
@@ -79,59 +84,96 @@ unload_stack_for_rollback() {
     done
 }
 
-verify_loaded_stack() {
-    local module
+check_loaded_stack() {
+    local module failed=0
 
+    LOADED_ERROR=''
     for module in "${MODULES[@]}"; do
-        module_loaded "$module" || die "$module is not loaded"
+        if ! module_loaded "$module"; then
+            [[ -n $LOADED_ERROR ]] || LOADED_ERROR="$module is not loaded"
+            failed=1
+        fi
     done
+    return "$failed"
+}
+
+verify_loaded_stack() {
+    check_loaded_stack || die "$LOADED_ERROR"
+}
+
+check_overlay_resolution() {
+    local index resolved expected failed=0
+
+    RESOLUTION_ERROR=''
+    for index in "${!MODULES[@]}"; do
+        expected="$ACTIVE/${MODULE_FILES[$index]}"
+        if ! resolved=$("$MODINFO" -k "$KVER" -n "${MODULES[$index]}"); then
+            [[ -n $RESOLUTION_ERROR ]] || RESOLUTION_ERROR="could not resolve ${MODULES[$index]}"
+            failed=1
+        elif [[ $resolved != "$expected" ]]; then
+            [[ -n $RESOLUTION_ERROR ]] ||
+                RESOLUTION_ERROR="${MODULES[$index]} resolves outside the active overlay: $resolved"
+            failed=1
+        fi
+    done
+    return "$failed"
 }
 
 verify_overlay_resolution() {
-    local index resolved expected
+    check_overlay_resolution || die "$RESOLUTION_ERROR"
+}
 
-    for index in "${!MODULES[@]}"; do
-        resolved=$("$MODINFO" -k "$KVER" -n "${MODULES[$index]}")
-        expected="$ACTIVE/${MODULE_FILES[$index]}"
-        [[ $resolved == "$expected" ]] ||
-            die "${MODULES[$index]} resolves outside the active overlay: $resolved"
+check_stock_resolution() {
+    local module resolved failed=0
+
+    RESOLUTION_ERROR=''
+    for module in "${MODULES[@]}"; do
+        if ! resolved=$("$MODINFO" -k "$KVER" -n "$module"); then
+            [[ -n $RESOLUTION_ERROR ]] || RESOLUTION_ERROR="could not resolve $module"
+            failed=1
+        elif [[ $resolved != "$KERNEL_ROOT/kernel/"* ]]; then
+            [[ -n $RESOLUTION_ERROR ]] || RESOLUTION_ERROR="$module does not resolve to a stock module: $resolved"
+            failed=1
+        fi
     done
+    return "$failed"
 }
 
 verify_stock_resolution() {
-    local module resolved
-
-    for module in "${MODULES[@]}"; do
-        resolved=$("$MODINFO" -k "$KVER" -n "$module")
-        [[ $resolved == "$KERNEL_ROOT/kernel/"* ]] ||
-            die "$module does not resolve to a stock module: $resolved"
-    done
+    check_stock_resolution || die "$RESOLUTION_ERROR"
 }
 
-is_generated() {
-    local file=$1 line count=0
+matches_generated() {
+    local file=$1 expected=$2
 
-    [[ -f $file && ! -L $file ]] || return 1
-    while IFS= read -r line && ((count < 2)); do
-        [[ $line != "$GENERATED" ]] || return 0
-        ((count += 1))
-    done < "$file"
-    return 1
+    [[ -f $file && ! -L $file && -n $expected && -f $expected ]] || return 1
+    cmp -s "$file" "$expected"
 }
 
 restore_settings() {
+    local backup recovery
+
     if ((aspm_installed)); then
         rm -f "$ASPM_TARGET"
     fi
     if ((aspm_backed_up)); then
-        mv "$SETTINGS_TMP/aspm.previous" "$ASPM_TARGET" || warn "could not restore $ASPM_TARGET"
+        backup="$SETTINGS_TMP/aspm.previous"
+        if ! mv "$backup" "$ASPM_TARGET"; then
+            preserve_settings_tmp=1
+            printf -v recovery 'mv -- %q %q' "$backup" "$ASPM_TARGET"
+            warn "could not restore $ASPM_TARGET; backup preserved at $backup; restore it manually with: $recovery"
+        fi
     fi
     if ((dispatcher_installed)); then
         rm -f "$DISPATCHER_TARGET"
     fi
     if ((dispatcher_backed_up)); then
-        mv "$SETTINGS_TMP/dispatcher.previous" "$DISPATCHER_TARGET" ||
-            warn "could not restore $DISPATCHER_TARGET"
+        backup="$SETTINGS_TMP/dispatcher.previous"
+        if ! mv "$backup" "$DISPATCHER_TARGET"; then
+            preserve_settings_tmp=1
+            printf -v recovery 'mv -- %q %q' "$backup" "$DISPATCHER_TARGET"
+            warn "could not restore $DISPATCHER_TARGET; backup preserved at $backup; restore it manually with: $recovery"
+        fi
     fi
 }
 
@@ -153,6 +195,12 @@ rollback() {
     if ! "$MODPROBE" mt7925e; then
         warn 'could not reload mt7925e'
     fi
+    if [[ -d $ACTIVE ]]; then
+        check_overlay_resolution || warn "rollback module resolution verification failed: $RESOLUTION_ERROR"
+    else
+        check_stock_resolution || warn "rollback module resolution verification failed: $RESOLUTION_ERROR"
+    fi
+    check_loaded_stack || warn "rollback loaded module verification failed: $LOADED_ERROR"
 }
 
 finish() {
@@ -164,7 +212,9 @@ finish() {
         rollback
     fi
     [[ -z $NEW ]] || rm -rf "$NEW"
-    [[ -z $SETTINGS_TMP ]] || rm -rf "$SETTINGS_TMP"
+    if [[ -n $SETTINGS_TMP ]] && ((preserve_settings_tmp == 0)); then
+        rm -rf "$SETTINGS_TMP"
+    fi
     exit "$status"
 }
 trap finish EXIT
@@ -255,46 +305,34 @@ validate_stage() {
 }
 
 prepare_settings() {
-    local disable_aspm=$1 disable_power_save=$2 iw_quoted
+    local disable_aspm=$1 disable_power_save=$2 iw_quoted resolved=''
     local manage_aspm=$disable_aspm manage_dispatcher=$disable_power_save
+    local has_aspm=0 has_dispatcher=0
 
-    if [[ $disable_aspm == 1 && ( -e $ASPM_TARGET || -L $ASPM_TARGET ) ]]; then
-        is_generated "$ASPM_TARGET" || die "refusing to replace user-owned file: $ASPM_TARGET"
-    elif is_generated "$ASPM_TARGET"; then
-        manage_aspm=1
-    fi
-    if [[ $disable_power_save == 1 ]]; then
-        resolve_command IW "$IW"
-        if [[ -e $DISPATCHER_TARGET || -L $DISPATCHER_TARGET ]]; then
-            is_generated "$DISPATCHER_TARGET" ||
-                die "refusing to replace user-owned file: $DISPATCHER_TARGET"
-        fi
-    elif is_generated "$DISPATCHER_TARGET"; then
-        manage_dispatcher=1
-    fi
-    ((manage_aspm || manage_dispatcher)) || return 0
+    [[ ! -e $ASPM_TARGET && ! -L $ASPM_TARGET ]] || has_aspm=1
+    [[ ! -e $DISPATCHER_TARGET && ! -L $DISPATCHER_TARGET ]] || has_dispatcher=1
+    ((disable_aspm || disable_power_save || has_aspm || has_dispatcher)) || return 0
 
     [[ $disable_aspm == 0 ]] || mkdir -p "${ASPM_TARGET%/*}"
     [[ $disable_power_save == 0 ]] || mkdir -p "${DISPATCHER_TARGET%/*}"
-    if ((manage_aspm)); then
-        [[ -d ${ASPM_TARGET%/*} && ! -L ${ASPM_TARGET%/*} ]] ||
-            die 'unsafe modprobe configuration directory'
-    fi
-    if ((manage_dispatcher)); then
-        [[ -d ${DISPATCHER_TARGET%/*} && ! -L ${DISPATCHER_TARGET%/*} ]] ||
-            die 'unsafe NetworkManager dispatcher directory'
-    fi
     SETTINGS_TMP=$(mktemp -d "$ETC_ROOT/.$PROJECT.XXXXXX")
     chmod 700 "$SETTINGS_TMP"
 
-    if [[ $disable_aspm == 1 ]]; then
-        ASPM_DESIRED="$SETTINGS_TMP/aspm.new"
-        printf '%s\noptions mt7925e disable_aspm=1\n' "$GENERATED" > "$ASPM_DESIRED"
-        chmod 644 "$ASPM_DESIRED"
+    if ((disable_aspm || has_aspm)); then
+        ASPM_EXPECTED="$SETTINGS_TMP/aspm.generated"
+        printf '%s\noptions mt7925e disable_aspm=1\n' "$GENERATED" > "$ASPM_EXPECTED"
+        chmod 644 "$ASPM_EXPECTED"
     fi
 
-    if [[ $disable_power_save == 1 ]]; then
-        DISPATCHER_DESIRED="$SETTINGS_TMP/dispatcher.new"
+    if ((disable_power_save || has_dispatcher)); then
+        if resolved=$(command -v "$IW"); then
+            IW=$resolved
+        elif ((disable_power_save)); then
+            die "required command not found: $IW"
+        fi
+    fi
+    if [[ -n $resolved ]]; then
+        DISPATCHER_EXPECTED="$SETTINGS_TMP/dispatcher.generated"
         printf -v iw_quoted '%q' "$IW"
         {
             printf '%s\n' '#!/usr/bin/env bash' "$GENERATED" '' 'set -euo pipefail' ''
@@ -305,16 +343,45 @@ prepare_settings() {
             printf '%s\n' 'module_path=$(readlink -f -- "/sys/class/net/$IFACE/device/driver/module" 2>/dev/null) || exit 0'
             printf '%s\n' '[[ ${module_path##*/} == mt7925e ]] || exit 0'
             printf 'exec %s dev "$IFACE" set power_save off\n' "$iw_quoted"
-        } > "$DISPATCHER_DESIRED"
-        chmod 755 "$DISPATCHER_DESIRED"
+        } > "$DISPATCHER_EXPECTED"
+        chmod 755 "$DISPATCHER_EXPECTED"
     fi
+
+    if ((has_aspm)); then
+        if matches_generated "$ASPM_TARGET" "$ASPM_EXPECTED"; then
+            manage_aspm=1
+        elif ((disable_aspm)); then
+            die "refusing to replace user-owned file: $ASPM_TARGET"
+        else
+            manage_aspm=0
+        fi
+    fi
+    if ((has_dispatcher)); then
+        if matches_generated "$DISPATCHER_TARGET" "$DISPATCHER_EXPECTED"; then
+            manage_dispatcher=1
+        elif ((disable_power_save)); then
+            die "refusing to replace user-owned file: $DISPATCHER_TARGET"
+        else
+            manage_dispatcher=0
+        fi
+    fi
+    if ((manage_aspm)); then
+        [[ -d ${ASPM_TARGET%/*} && ! -L ${ASPM_TARGET%/*} ]] ||
+            die 'unsafe modprobe configuration directory'
+    fi
+    if ((manage_dispatcher)); then
+        [[ -d ${DISPATCHER_TARGET%/*} && ! -L ${DISPATCHER_TARGET%/*} ]] ||
+            die 'unsafe NetworkManager dispatcher directory'
+    fi
+    [[ $disable_aspm == 0 ]] || ASPM_DESIRED=$ASPM_EXPECTED
+    [[ $disable_power_save == 0 ]] || DISPATCHER_DESIRED=$DISPATCHER_EXPECTED
 }
 
 activate_setting() {
-    local target=$1 desired=$2 name=$3
+    local target=$1 desired=$2 expected=$3 name=$4
 
     if [[ -e $target || -L $target ]]; then
-        if is_generated "$target"; then
+        if matches_generated "$target" "$expected"; then
             mv "$target" "$SETTINGS_TMP/$name.previous"
             printf -v "${name}_backed_up" '%s' 1
         elif [[ -n $desired ]]; then
@@ -330,8 +397,8 @@ activate_setting() {
 }
 
 activate_settings() {
-    activate_setting "$ASPM_TARGET" "$ASPM_DESIRED" aspm
-    activate_setting "$DISPATCHER_TARGET" "$DISPATCHER_DESIRED" dispatcher
+    activate_setting "$ASPM_TARGET" "$ASPM_DESIRED" "$ASPM_EXPECTED" aspm
+    activate_setting "$DISPATCHER_TARGET" "$DISPATCHER_DESIRED" "$DISPATCHER_EXPECTED" dispatcher
 }
 
 copy_overlay() {
