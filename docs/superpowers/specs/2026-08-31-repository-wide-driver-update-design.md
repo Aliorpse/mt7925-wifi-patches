@@ -95,6 +95,10 @@ An offline or failed fetch is an error. The script must not silently report an
 old checkout as current. Re-running always starts from a clean resolved source,
 so patch state files inside `.git` are unnecessary.
 
+An exclusive repository-local build lock covers source reset, patching, build,
+staging, and installer handoff. A concurrent rebuild exits before changing the
+shared source tree, preventing mixed-SHA module sets.
+
 Following HEAD means future upstream API changes can still require maintenance.
 The contract is therefore: known API generations are adapted; unknown source or
 patch shapes stop before installation and print the source SHA, kernel release,
@@ -199,7 +203,7 @@ The top-level rebuild is run as the invoking user, without `sudo`:
    `mt76.ko`, `mt76-connac-lib.ko`, `mt792x-lib.ko`,
    `mt7925-common.ko`, and `mt7925e.ko`.
 6. Validate that all five files exist, are non-empty, identify as kernel
-   modules, and have vermagic for the running kernel.
+   modules, and have a first vermagic token exactly equal to the running kernel.
 7. Invoke `sudo` only for the installation transaction and explicitly selected
    stability settings.
 
@@ -217,20 +221,33 @@ Custom files will live under:
 
 `/lib/modules/$KVER/updates/mt7925-wifi-patches/`
 
+Transaction state stays outside the kernel version tree so `depmod` cannot scan
+staged or previous modules. On the same filesystem it lives under:
+
+`/lib/modules/.mt7925-wifi-patches/$KVER/{new,previous}`
+
 Package-owned files under `kernel/drivers/...` are never overwritten. The
 external `updates/` location gives the custom modules normal depmod precedence
 and makes portable rollback a removal operation rather than a package restore.
 
 Privileged installation performs these stages:
 
-1. Copy staged files and build metadata into a new sibling directory.
-2. Require current mt76/MT7925 modules to unload successfully when loaded. An
+1. Acquire one privileged global transaction lock shared by install and revert.
+2. Copy staged files and build metadata into the external transaction `new`
+   directory.
+3. Require current mt76/MT7925 modules to unload successfully when loaded. An
    in-use module aborts installation before activating new files.
-3. Rename any existing project overlay to a per-kernel previous directory.
-4. Rename the new directory into place and run `depmod -a $KVER`.
-5. Verify `modinfo -n` resolves all five module names to the project overlay.
-6. Load `mt7925e` and verify the expected module stack is loaded.
-7. Remove the previous overlay only after all checks pass.
+4. Rename any existing project overlay to the external transaction `previous`
+   directory.
+5. Rename `new` into place, run `depmod -a $KVER`, and verify `modinfo -n`
+   resolves all five module names to the project overlay.
+6. Activate transactionally staged optional settings before module load so
+   modprobe reads the requested ASPM option and the dispatcher can observe the
+   interface-up event.
+7. Load `mt7925e` and verify the expected module stack is loaded.
+8. Mark the verified state committed, then remove `previous` as best-effort
+   cleanup. Cleanup failure warns and preserves the active verified state; it
+   never triggers rollback to a partially deleted backup.
 
 On any failure after activation, rollback unloads any partial custom stack,
 restores the previous project overlay or removes the new overlay when none
@@ -246,7 +263,7 @@ Revert is scoped to the running kernel:
 2. Obtain confirmation unless a documented noninteractive flag is supplied.
 3. Require the active MT7925 stack to unload when loaded.
 4. Remove only `/lib/modules/$KVER/updates/mt7925-wifi-patches/` and any stale
-   transaction sibling for that kernel.
+   external transaction state for that kernel.
 5. Remove optional config files only when their generated ownership header and
    expected content match.
 6. Run depmod and verify `modinfo -n mt7925e` no longer resolves inside the
@@ -285,6 +302,10 @@ the prior project-owned files and rolls back the driver transaction.
 - Optional ASPM configuration is present only when selected.
 - Power-save state is read only from an interface bound to `mt7925e`.
 
+A path under the package-owned `$KVER/kernel/` tree is stock. Any other external
+module path that is not this project's exact overlay is reported as an unknown
+external driver, never as stock.
+
 The checker reports installed-but-not-loaded, stale-kernel, missing metadata,
 and stock-driver states separately. It no longer treats a marker as proof and
 does not label enabled ASPM/power-save as an error when those options were not
@@ -313,6 +334,9 @@ The compile matrix covers:
 - Linux 6.18, 7.0, 7.1, and 7.2 API generations with GCC.
 - One old-kernel Clang/`LLVM=1` build for issue #5.
 - Current native kernel APIs, where no compatibility patch is expected.
+
+Every API row asserts exactly the five expected module outputs. The native row
+must report no compatibility patch.
 
 Vanilla source-tag jobs are explicitly named API compile checks. Where only
 `modules_prepare` is available, unresolved base-kernel symbols are not presented
