@@ -17,6 +17,7 @@ COMMAND_LOG="$TEST_DIR/commands.log"
 MODINFO_LOG="$TEST_DIR/modinfo.log"
 DEPMOD_STATE="$TEST_DIR/depmod.state"
 IW_LOG="$TEST_DIR/iw.log"
+WRITE_LOG="$TEST_DIR/writes.log"
 FAIL_MARKER="$TEST_DIR/fail-once"
 PACKAGE_SNAPSHOT="$TEST_DIR/package-snapshot"
 KVER='7.2.0-overlay-test'
@@ -26,6 +27,13 @@ RUN_STATUS=0
 REAL_CP="$(command -v cp)"
 REAL_MV="$(command -v mv)"
 REAL_RM="$(command -v rm)"
+REAL_MKDIR="$(command -v mkdir)"
+IW_COMMAND=''
+NETWORK_MANAGER_COMMAND=''
+FLOCK_DIR=''
+HOLD_READY=''
+HOLD_RELEASE=''
+ALLOW_PRESERVED_SETTINGS=0
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -112,14 +120,14 @@ make_stage() {
     for file in mt76.ko mt76-connac-lib.ko mt792x-lib.ko mt7925-common.ko mt7925e.ko; do
         printf '%s %s\n' "$tag" "$file" > "$stage/$file"
     done
-    printf 'kernel=%s\nsource_sha=0123456789abcdef\ncompiler=test compiler\npatches=none\nbuild=%s\n' \
-        "$kver" "$tag" > "$stage/.build-info"
+    printf 'kernel=%s\nsource_sha=0123456789abcdef0123456789abcdef01234567\ncompiler=test compiler\npatches=none\n' \
+        "$kver" > "$stage/.build-info"
     printf '%s\n' "$stage"
 }
 
 reset_fixture() {
     rm -rf "$FAKE_ROOT" "$STAGES" "$PACKAGE_SNAPSHOT"
-    rm -f "$OUTPUT" "$COMMAND_LOG" "$MODINFO_LOG" "$IW_LOG" "$FAIL_MARKER" "$TEST_DIR/sudo.log"
+    rm -f "$OUTPUT" "$COMMAND_LOG" "$MODINFO_LOG" "$IW_LOG" "$WRITE_LOG" "$FAIL_MARKER" "$TEST_DIR/sudo.log"
     mkdir -p "$STAGES" "$ETC_ROOT/modprobe.d" "$ETC_ROOT/NetworkManager/dispatcher.d"
     make_stock_kernel "$KVER"
     write_loaded_stack
@@ -127,23 +135,45 @@ reset_fixture() {
     printf 'stock\n' > "$DEPMOD_STATE"
     "$REAL_CP" -R "$MODULES_ROOT/$KVER/kernel" "$PACKAGE_SNAPSHOT"
     FAIL_STAGE=''
+    IW_COMMAND="$FAKE_BIN/iw"
+    NETWORK_MANAGER_COMMAND="$FAKE_BIN/NetworkManager"
+    FLOCK_DIR=''
+    HOLD_READY=''
+    HOLD_RELEASE=''
+    ALLOW_PRESERVED_SETTINGS=0
 }
 
 make_fake_commands() {
     mkdir -p "$FAKE_BIN"
 
+    cat > "$FAKE_BIN/mkdir" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+    case $arg in
+        "$FAKE_MODULES_ROOT"/*|"$FAKE_ETC_ROOT"/*)
+            printf 'mkdir %s\n' "$*" >> "$FAKE_WRITE_LOG"
+            break
+            ;;
+    esac
+done
+exec "$FAKE_REAL_MKDIR" "$@"
+EOF
+
     cat > "$FAKE_BIN/cp" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+destination=${!#}
 if [[ ${FAKE_FAIL_STAGE-} == copy ]]; then
-    for arg in "$@"; do
-        if [[ $arg == *'/.mt7925-wifi-patches.new'* ]]; then
-            printf 'fake copy failure\n' >&2
-            exit 70
-        fi
-    done
+    if [[ $destination == */.mt7925-wifi-patches/*/new/* ]]; then
+        printf 'fake copy failure\n' >&2
+        exit 70
+    fi
 fi
-exec "$FAKE_REAL_CP" "$@"
+"$FAKE_REAL_CP" "$@"
+if [[ ${FAKE_FAIL_STAGE-} == metadata-copy && $destination == */new/.build-info ]]; then
+    printf 'unexpected=root-copy-corruption\n' >> "$destination"
+fi
 EOF
 
     cat > "$FAKE_BIN/mv" <<'EOF'
@@ -173,11 +203,11 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 target=${!#}
-if [[ ${FAKE_FAIL_STAGE-} == settings-live-modified && $target == */.mt7925-wifi-patches.previous && ! -e $FAKE_FAIL_MARKER ]]; then
-    printf '# transaction-time local modification\n' >> "$FAKE_ASPM_TARGET"
+if [[ ${FAKE_FAIL_STAGE-} =~ ^cleanup-(install|revert)$ && $target == */.mt7925-wifi-patches/*/previous && -d $target && ! -e $FAKE_FAIL_MARKER ]]; then
+    "$FAKE_REAL_RM" -f "$target/mt76.ko"
     : > "$FAKE_FAIL_MARKER"
-    printf 'fake finalization failure after live settings modification\n' >&2
-    exit 76
+    printf 'fake partial previous-overlay cleanup failure\n' >&2
+    exit 77
 fi
 exec "$FAKE_REAL_RM" "$@"
 EOF
@@ -187,25 +217,34 @@ EOF
 set -euo pipefail
 printf 'depmod %s\n' "$*" >> "$FAKE_COMMAND_LOG"
 [[ $# -eq 2 && $1 == -a && $2 == "$FAKE_KVER" ]] || exit 2
+if [[ -n ${FAKE_HOLD_READY-} && ! -e $FAKE_HOLD_READY ]]; then
+    : > "$FAKE_HOLD_READY"
+    while [[ ! -e ${FAKE_HOLD_RELEASE-} ]]; do
+        sleep 0.01
+    done
+fi
+for forbidden in \
+    "$FAKE_MODULES_ROOT/$FAKE_KVER/updates/.mt7925-wifi-patches.new" \
+    "$FAKE_MODULES_ROOT/$FAKE_KVER/updates/.mt7925-wifi-patches.previous"; do
+    [[ ! -e $forbidden ]] || {
+        printf 'depmod-visible transaction directory: %s\n' "$forbidden" >&2
+        exit 78
+    }
+done
 active="$FAKE_MODULES_ROOT/$FAKE_KVER/updates/mt7925-wifi-patches/.build-info"
 resolution=stock
 if [[ -f $active ]]; then
-    build=''
-    while IFS= read -r line; do
-        [[ $line != build=* ]] || build=${line#build=}
-    done < "$active"
+    read -r build _ < "${active%/.build-info}/mt7925e.ko"
     [[ -n $build ]] || exit 2
     resolution="overlay:$build"
 fi
 if [[ ${FAKE_FAIL_STAGE-} =~ ^(depmod|rollback-resolution|rollback-stack)$ && -f $active && ! -e $FAKE_FAIL_MARKER ]]; then
-    while IFS= read -r line; do
-        if [[ $line == 'build=new' ]]; then
-            printf 'stale\n' > "$FAKE_DEPMOD_STATE"
-            : > "$FAKE_FAIL_MARKER"
-            printf 'fake depmod failure\n' >&2
-            exit 72
-        fi
-    done < "$active"
+    if [[ $build == new ]]; then
+        printf 'stale\n' > "$FAKE_DEPMOD_STATE"
+        : > "$FAKE_FAIL_MARKER"
+        printf 'fake depmod failure\n' >&2
+        exit 72
+    fi
 fi
 if [[ ${FAKE_FAIL_STAGE-} == rollback-resolution && -e $FAKE_FAIL_MARKER ]]; then
     printf 'stale\n' > "$FAKE_DEPMOD_STATE"
@@ -230,21 +269,16 @@ case $module in
 esac
 active="$FAKE_MODULES_ROOT/$FAKE_KVER/updates/mt7925-wifi-patches"
 if [[ -f $active/$file ]]; then
-    build=''
-    while IFS= read -r line; do
-        [[ $line != build=* ]] || build=${line#build=}
-    done < "$active/.build-info"
+    read -r build _ < "$active/mt7925e.ko"
     if [[ $(<"$FAKE_DEPMOD_STATE") != "overlay:$build" ]]; then
         printf '%s/stale/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER" "$file"
         exit 0
     fi
     if [[ ${FAKE_FAIL_STAGE-} == modinfo && $module == mt7925e ]]; then
-        while IFS= read -r line; do
-            [[ $line != 'build=new' ]] || {
-                printf '%s/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER/kernel/drivers/net/wireless/mediatek/mt76" "$stock"
-                exit 0
-            }
-        done < "$active/.build-info"
+        if [[ $build == new ]]; then
+            printf '%s/%s\n' "$FAKE_MODULES_ROOT/$FAKE_KVER/kernel/drivers/net/wireless/mediatek/mt76" "$stock"
+            exit 0
+        fi
     fi
     printf '%s/%s\n' "$active" "$file"
 else
@@ -276,6 +310,12 @@ if [[ ${1-} == -r && $# -eq 2 ]]; then
 fi
 [[ $# -eq 1 && $1 == mt7925e ]] || exit 2
 active="$FAKE_MODULES_ROOT/$FAKE_KVER/updates/mt7925-wifi-patches/.build-info"
+if [[ ${FAKE_FAIL_STAGE-} == settings-live-modified && -f $active && ! -e $FAKE_FAIL_MARKER ]]; then
+    printf '# transaction-time local modification\n' >> "$FAKE_ASPM_TARGET"
+    : > "$FAKE_FAIL_MARKER"
+    printf 'fake module-load failure after live settings modification\n' >&2
+    exit 76
+fi
 if [[ ${FAKE_FAIL_STAGE-} == load && -f $active && ! -e $FAKE_FAIL_MARKER ]]; then
     cat > "$FAKE_PROC_MODULES" <<'PARTIAL'
 mt76 1 0 - Live 0x0
@@ -295,6 +335,30 @@ mt7925e 1 1 mt7925_common, Live 0x0
 PARTIAL
     exit 0
 fi
+if [[ ${FAKE_FAIL_STAGE-} != settings-restore ]]; then
+    if [[ ${FAKE_EXPECT_ASPM-0} == 1 ]]; then
+        [[ -f $FAKE_ASPM_TARGET ]] || {
+            printf 'ASPM setting was not active before module load\n' >&2
+            exit 79
+        }
+    elif [[ ${FAKE_ALLOW_PRESERVED_SETTINGS-0} == 0 ]]; then
+        [[ ! -e $FAKE_ASPM_TARGET ]] || {
+            printf 'ASPM setting was not removed before module load\n' >&2
+            exit 79
+        }
+    fi
+    if [[ ${FAKE_EXPECT_DISPATCHER-0} == 1 ]]; then
+        [[ -f $FAKE_DISPATCHER_TARGET ]] || {
+            printf 'dispatcher was not active before module load\n' >&2
+            exit 79
+        }
+    elif [[ ${FAKE_ALLOW_PRESERVED_SETTINGS-0} == 0 ]]; then
+        [[ ! -e $FAKE_DISPATCHER_TARGET ]] || {
+            printf 'dispatcher was not removed before module load\n' >&2
+            exit 79
+        }
+    fi
+fi
 cat > "$FAKE_PROC_MODULES" <<'LOADED'
 mt76 1 0 - Live 0x0
 mt76_connac_lib 1 1 mt76, Live 0x0
@@ -302,6 +366,19 @@ mt792x_lib 1 1 mt76_connac_lib, Live 0x0
 mt7925_common 1 1 mt792x_lib, Live 0x0
 mt7925e 1 1 mt7925_common, Live 0x0
 LOADED
+EOF
+
+    cat > "$FAKE_BIN/NetworkManager" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+    cat > "$FAKE_BIN/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 2 && $1 == -n && $2 =~ ^[0-9]+$ ]] || exit 2
+[[ -n ${FAKE_FLOCK_DIR-} ]] || exit 0
+mkdir "$FAKE_FLOCK_DIR" 2>/dev/null
 EOF
 
     cat > "$FAKE_BIN/iw" <<'EOF'
@@ -335,8 +412,14 @@ EOF
 
 run_overlay() {
     local dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+    local expect_aspm=0 expect_dispatcher=0 run_output=${RUN_OUTPUT:-$OUTPUT}
 
-    rm -f "$OUTPUT"
+    if [[ ${1-} == install ]]; then
+        expect_aspm=${4-0}
+        expect_dispatcher=${5-0}
+    fi
+
+    rm -f "$run_output"
     if PATH="$FAKE_BIN:$PATH" \
         MT7925_MODULES_ROOT="$MODULES_ROOT" \
         MT7925_ETC_ROOT="$ETC_ROOT" \
@@ -344,22 +427,33 @@ run_overlay() {
         MT7925_MODPROBE="$FAKE_BIN/modprobe" \
         MT7925_DEPMOD="$FAKE_BIN/depmod" \
         MT7925_MODINFO="$FAKE_BIN/modinfo" \
-        MT7925_IW="$FAKE_BIN/iw" \
+        MT7925_IW="$IW_COMMAND" \
+        MT7925_NETWORK_MANAGER="$NETWORK_MANAGER_COMMAND" \
+        MT7925_FLOCK="$FAKE_BIN/flock" \
         FAKE_MODULES_ROOT="$MODULES_ROOT" \
         FAKE_PROC_MODULES="$PROC_MODULES" \
         FAKE_COMMAND_LOG="$COMMAND_LOG" \
+        FAKE_WRITE_LOG="$WRITE_LOG" \
         FAKE_MODINFO_LOG="$MODINFO_LOG" \
         FAKE_DEPMOD_STATE="$DEPMOD_STATE" \
         FAKE_IW_LOG="$IW_LOG" \
         FAKE_FAIL_STAGE="$FAIL_STAGE" \
         FAKE_FAIL_MARKER="$FAIL_MARKER" \
+        FAKE_FLOCK_DIR="$FLOCK_DIR" \
+        FAKE_HOLD_READY="$HOLD_READY" \
+        FAKE_HOLD_RELEASE="$HOLD_RELEASE" \
+        FAKE_EXPECT_ASPM="$expect_aspm" \
+        FAKE_EXPECT_DISPATCHER="$expect_dispatcher" \
+        FAKE_ALLOW_PRESERVED_SETTINGS="$ALLOW_PRESERVED_SETTINGS" \
         FAKE_ASPM_TARGET="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf" \
         FAKE_DISPATCHER_TARGET="$dispatcher" \
+        FAKE_ETC_ROOT="$ETC_ROOT" \
         FAKE_REAL_CP="$REAL_CP" \
         FAKE_REAL_MV="$REAL_MV" \
         FAKE_REAL_RM="$REAL_RM" \
+        FAKE_REAL_MKDIR="$REAL_MKDIR" \
         FAKE_KVER="$KVER" \
-        "$HELPER" "$@" > "$OUTPUT" 2>&1; then
+        "$HELPER" "$@" > "$run_output" 2>&1; then
         RUN_STATUS=0
     else
         RUN_STATUS=$?
@@ -381,9 +475,12 @@ assert_package_unchanged() {
 
 assert_no_transaction_siblings() {
     local updates="$MODULES_ROOT/$KVER/updates"
+    local transaction="$MODULES_ROOT/.mt7925-wifi-patches/$KVER"
 
     [[ ! -e $updates/.mt7925-wifi-patches.new ]] || fail 'new transaction directory remained'
     [[ ! -e $updates/.mt7925-wifi-patches.previous ]] || fail 'previous transaction directory remained'
+    [[ ! -e $transaction/new ]] || fail 'new external transaction directory remained'
+    [[ ! -e $transaction/previous ]] || fail 'previous external transaction directory remained'
 }
 
 assert_resolves_stock() {
@@ -424,14 +521,12 @@ assert_modinfo_calls() {
 }
 
 assert_overlay_tag() {
-    local expected=$1 line found=0
-    local info="$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches/.build-info"
+    local expected=$1 actual
+    local module="$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches/mt7925e.ko"
 
-    [[ -f $info ]] || fail 'active overlay metadata is missing'
-    while IFS= read -r line; do
-        [[ $line != "build=$expected" ]] || found=1
-    done < "$info"
-    [[ $found -eq 1 ]] || fail "active overlay is not build $expected"
+    [[ -f $module ]] || fail 'active overlay module is missing'
+    read -r actual _ < "$module"
+    [[ $actual == "$expected" ]] || fail "active overlay is not build $expected"
 }
 
 assert_loaded_stack() {
@@ -484,6 +579,39 @@ test_strict_validation() {
     pass 'strict KVER and exact stage validation'
 }
 
+test_exact_metadata_validation() {
+    local stage case_name
+
+    for case_name in extra duplicate short-sha empty-compiler copied-corruption; do
+        reset_fixture
+        stage=$(make_stage "metadata-$case_name" metadata)
+        case $case_name in
+            extra)
+                printf 'unexpected=value\n' >> "$stage/.build-info"
+                ;;
+            duplicate)
+                printf 'patches=nan\n' >> "$stage/.build-info"
+                ;;
+            short-sha)
+                printf 'kernel=%s\nsource_sha=0123456789abcdef\ncompiler=test compiler\npatches=none\n' \
+                    "$KVER" > "$stage/.build-info"
+                ;;
+            empty-compiler)
+                printf 'kernel=%s\nsource_sha=0123456789abcdef0123456789abcdef01234567\ncompiler=\npatches=none\n' \
+                    "$KVER" > "$stage/.build-info"
+                ;;
+            copied-corruption)
+                FAIL_STAGE=metadata-copy
+                ;;
+        esac
+        run_overlay install "$stage" "$KVER" 0 0
+        assert_failed_install_is_stock
+        assert_no_transaction_siblings
+        assert_package_unchanged
+    done
+    pass 'stage and root-owned metadata require the exact four-field producer contract'
+}
+
 test_first_and_replacement_install() {
     local first second expected_log
 
@@ -512,18 +640,23 @@ test_first_and_replacement_install() {
 }
 
 test_other_kernel_untouched() {
-    local stage before after
+    local stage before after transaction_before transaction_after
 
     reset_fixture
     make_stock_kernel "$OTHER_KVER"
     mkdir -p "$MODULES_ROOT/$OTHER_KVER/updates/mt7925-wifi-patches"
     printf 'other kernel overlay\n' > "$MODULES_ROOT/$OTHER_KVER/updates/mt7925-wifi-patches/mt7925e.ko"
+    mkdir -p "$MODULES_ROOT/.mt7925-wifi-patches/$OTHER_KVER/previous"
+    printf 'other transaction\n' > "$MODULES_ROOT/.mt7925-wifi-patches/$OTHER_KVER/previous/mt7925e.ko"
     before=$(cksum "$MODULES_ROOT/$OTHER_KVER/updates/mt7925-wifi-patches/mt7925e.ko")
+    transaction_before=$(cksum "$MODULES_ROOT/.mt7925-wifi-patches/$OTHER_KVER/previous/mt7925e.ko")
     stage=$(make_stage scoped scoped)
     run_overlay install "$stage" "$KVER" 0 0
     assert_success
     after=$(cksum "$MODULES_ROOT/$OTHER_KVER/updates/mt7925-wifi-patches/mt7925e.ko")
+    transaction_after=$(cksum "$MODULES_ROOT/.mt7925-wifi-patches/$OTHER_KVER/previous/mt7925e.ko")
     [[ $after == "$before" ]] || fail 'another kernel overlay changed'
+    [[ $transaction_after == "$transaction_before" ]] || fail 'another kernel transaction state changed'
     pass 'current-kernel scoping leaves another kernel path untouched'
 }
 
@@ -539,6 +672,28 @@ test_pre_activation_failures() {
         [[ $failure != unload ]] || assert_loaded_stack
     done
     pass 'partial unload and copy failures restore stock without package changes'
+}
+
+test_power_save_dependency_preflight() {
+    local stage missing
+
+    for missing in iw NetworkManager; do
+        reset_fixture
+        stage=$(make_stage "missing-$missing" dependencies)
+        if [[ $missing == iw ]]; then
+            IW_COMMAND="$FAKE_BIN/missing-iw"
+        else
+            NETWORK_MANAGER_COMMAND="$FAKE_BIN/missing-NetworkManager"
+        fi
+        run_overlay install "$stage" "$KVER" 0 1
+        assert_failed_install_is_stock
+        assert_contains "$OUTPUT" "required command not found"
+        [[ ! -s $WRITE_LOG ]] || fail "missing $missing dependency allowed a shared write"
+        [[ ! -s $COMMAND_LOG ]] || fail "missing $missing dependency reached module operations"
+        assert_no_transaction_siblings
+        assert_package_unchanged
+    done
+    pass 'power-save dependency failures stop before transaction writes'
 }
 
 test_stock_rollbacks() {
@@ -690,6 +845,92 @@ test_modified_live_setting_and_previous_backup_survive_rollback() {
     pass 'rollback preserves modified live setting and previous backup with recovery instructions'
 }
 
+test_cleanup_failures_preserve_committed_state() {
+    local old_stage new_stage transaction
+
+    reset_fixture
+    old_stage=$(make_stage cleanup-install-old old)
+    run_overlay install "$old_stage" "$KVER" 0 0
+    assert_success
+
+    new_stage=$(make_stage cleanup-install-new new)
+    FAIL_STAGE=cleanup-install
+    run_overlay install "$new_stage" "$KVER" 0 0
+    assert_success
+    assert_contains "$OUTPUT" 'cleanup warning'
+    assert_overlay_tag new
+    assert_resolves_overlay
+    assert_loaded_stack
+    transaction="$MODULES_ROOT/.mt7925-wifi-patches/$KVER"
+    [[ -d $transaction/previous ]] || fail 'partial previous backup was not preserved after install cleanup failure'
+    [[ ! -e $transaction/new ]] || fail 'new transaction directory remained after install cleanup failure'
+    assert_package_unchanged
+
+    reset_fixture
+    old_stage=$(make_stage cleanup-revert-old old)
+    run_overlay install "$old_stage" "$KVER" 0 0
+    assert_success
+    FAIL_STAGE=cleanup-revert
+    run_overlay revert "$KVER"
+    assert_success
+    assert_contains "$OUTPUT" 'cleanup warning'
+    [[ ! -e $MODULES_ROOT/$KVER/updates/mt7925-wifi-patches ]] ||
+        fail 'revert cleanup failure restored the removed overlay'
+    [[ -d $MODULES_ROOT/.mt7925-wifi-patches/$KVER/previous ]] ||
+        fail 'partial previous backup was not preserved after revert cleanup failure'
+    assert_resolves_stock
+    assert_loaded_stack
+    assert_package_unchanged
+    pass 'install and revert cleanup failures preserve the committed verified state'
+}
+
+test_concurrent_transaction_lock() {
+    local first_stage second_stage first_output="$TEST_DIR/first-transaction.output"
+    local second_output="$TEST_DIR/second-transaction.output" first_pid second_status
+
+    reset_fixture
+    first_stage=$(make_stage concurrent-first first)
+    second_stage=$(make_stage concurrent-second second)
+    FLOCK_DIR="$TEST_DIR/transaction-lock-held"
+    HOLD_READY="$TEST_DIR/first-depmod.ready"
+    HOLD_RELEASE="$TEST_DIR/first-depmod.release"
+    rm -rf "$FLOCK_DIR"
+    rm -f "$HOLD_READY" "$HOLD_RELEASE"
+
+    RUN_OUTPUT=$first_output run_overlay install "$first_stage" "$KVER" 0 0 &
+    first_pid=$!
+    for _ in {1..1000}; do
+        [[ -e $HOLD_READY ]] && break
+        sleep 0.01
+    done
+    [[ -e $HOLD_READY ]] || {
+        touch "$HOLD_RELEASE"
+        wait "$first_pid" || true
+        fail 'first transaction did not reach depmod'
+    }
+    assert_overlay_tag first
+
+    RUN_OUTPUT=$second_output run_overlay install "$second_stage" "$KVER" 0 0
+    second_status=$RUN_STATUS
+    assert_overlay_tag first
+
+    touch "$HOLD_RELEASE"
+    wait "$first_pid" || fail 'first locked transaction failed'
+    [[ $second_status -ne 0 ]] || fail 'concurrent privileged transaction loser was accepted'
+    assert_contains "$second_output" 'another module transaction is already running'
+    assert_overlay_tag first
+    assert_resolves_overlay
+    assert_loaded_stack
+    assert_no_transaction_siblings
+    assert_package_unchanged
+
+    rm -rf "$FLOCK_DIR"
+    FLOCK_DIR=''
+    HOLD_READY=''
+    HOLD_RELEASE=''
+    pass 'global transaction lock rejects a concurrent writer before shared changes'
+}
+
 test_exact_generated_settings_replace_and_revert() {
     local old_stage new_stage config dispatcher
 
@@ -748,6 +989,7 @@ test_modified_generated_settings_are_user_owned() {
         assert_no_transaction_siblings
         assert_package_unchanged
 
+        ALLOW_PRESERVED_SETTINGS=1
         run_overlay revert "$KVER"
         assert_success
         assert_file_equals "$modified_file" "$modified_before"
@@ -776,6 +1018,7 @@ test_user_owned_settings() {
     assert_file_equals "$dispatcher" "$dispatcher_before"
 
     FAIL_STAGE=''
+    ALLOW_PRESERVED_SETTINGS=1
     run_overlay revert "$KVER"
     assert_success
     assert_file_equals "$config" "$config_before"
@@ -837,6 +1080,7 @@ test_revert_and_repeated_revert() {
     dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
 
     FAIL_STAGE=unload
+    ALLOW_PRESERVED_SETTINGS=1
     run_overlay revert "$KVER"
     assert_failure
     assert_overlay_tag revert
@@ -846,6 +1090,7 @@ test_revert_and_repeated_revert() {
     assert_package_unchanged
 
     FAIL_STAGE=''
+    ALLOW_PRESERVED_SETTINGS=0
     run_overlay revert "$KVER"
     assert_success
     [[ ! -e $MODULES_ROOT/$KVER/updates/mt7925-wifi-patches ]] || fail 'revert left overlay active'
@@ -879,8 +1124,12 @@ test_thin_revert_wrapper() {
 
     rm -f "$sudo_log"
     printf 'n\n' | PATH="$FAKE_BIN:$PATH" FAKE_SUDO_LOG="$sudo_log" FAKE_KVER="$KVER" \
+        MT7925_MODULES_ROOT="$MODULES_ROOT" MT7925_ETC_ROOT="$ETC_ROOT" \
         "$REVERT" > "$OUTPUT" 2>&1 || fail 'declined revert returned failure'
     [[ ! -e $sudo_log ]] || fail 'declined revert invoked sudo'
+    assert_contains "$OUTPUT" "$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches"
+    assert_contains "$OUTPUT" "$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+    assert_contains "$OUTPUT" "$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
 
     if PATH="$FAKE_BIN:$PATH" FAKE_SUDO_LOG="$sudo_log" FAKE_KVER="$KVER" \
         "$REVERT" --unknown > "$OUTPUT" 2>&1; then
@@ -894,14 +1143,18 @@ make_fake_commands
 [[ -x $HELPER ]] || fail "missing helper: $HELPER"
 
 test_strict_validation
+test_exact_metadata_validation
 test_first_and_replacement_install
 test_other_kernel_untouched
 test_pre_activation_failures
+test_power_save_dependency_preflight
 test_stock_rollbacks
 test_rollback_verification_warnings
 test_previous_overlay_and_settings_rollback
 test_failed_settings_restore_preserves_backup
 test_modified_live_setting_and_previous_backup_survive_rollback
+test_cleanup_failures_preserve_committed_state
+test_concurrent_transaction_lock
 test_exact_generated_settings_replace_and_revert
 test_modified_generated_settings_are_user_owned
 test_user_owned_settings

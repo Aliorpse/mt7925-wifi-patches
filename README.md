@@ -26,6 +26,7 @@ CI tests these kernel API combinations against one resolved wireless-next SHA:
 | Linux 7.1 | GCC | API compile check |
 | Linux 7.2 | GCC | API compile check |
 | Linux 7.1 | Clang with `LLVM=1` | API compile check |
+| Current wireless-next APIs | GCC | API compile check, same tree |
 
 Legacy NAN compatibility disables NAN and NDI as one unit when the host NAN
 contract is incomplete. Linux 6.18, 7.0, and 7.1 select that path, so those
@@ -34,9 +35,10 @@ selected by the tested old rows through Linux 7.2, restores the
 pre-AQL MT7925 sleeping-station branch instead of calling an unavailable or
 unexported AQL helper.
 
-Source-tag jobs use `modules_prepare` and permit unresolved base-kernel symbols,
-so they test API compatibility, not whether a module can be loaded. A separate
-CI job builds against Fedora Rawhide's packaged `kernel-devel` tree and real
+Source-tag and current-native jobs use `modules_prepare` and permit unresolved
+base-kernel symbols, so they test API compatibility, not whether a module can
+be loaded. A separate CI job builds against Fedora Rawhide's packaged
+`kernel-devel` tree and real
 `Module.symvers` with strict modpost, exact-module, dependency, and vermagic
 checks. This matrix does not certify other kernel configurations,
 distributions, or devices. The weekly CI run is the moving-HEAD canary.
@@ -90,13 +92,18 @@ LLVM=1 ./mt76-rebuild.sh
 The script fetches and cleans the current `wireless-next/main`, feature-probes
 the target headers, applies only the required action-frame, EML, NAN, and AQL
 compatibility patches, and builds only the five modules listed above. Unknown
-header or source shapes stop before installation.
+header or source shapes stop before installation. A repository-local lock
+rejects concurrent rebuilds before either run can modify the shared source
+checkout.
 
 The privileged helper installs the staged modules at:
 
 ```text
 /lib/modules/$(uname -r)/updates/mt7925-wifi-patches/
 ```
+
+Staged and previous transaction copies stay outside the depmod-scanned kernel
+tree under `/lib/modules/.mt7925-wifi-patches/$(uname -r)/`.
 
 It unloads the active stack, swaps the external overlay transactionally, runs
 `depmod`, verifies that all five module names resolve to the new path, reloads
@@ -135,7 +142,7 @@ higher power use.
 
 `--disable-power-save` installs a NetworkManager dispatcher that turns power
 save off only for a managed interface bound to `mt7925e`. It can reduce latency
-at the cost of battery life.
+at the cost of battery life. This option requires both `iw` and NetworkManager.
 
 The installer refuses to replace a user-owned file at either target path.
 Revert removes only an exact project-generated setting; a locally changed file
@@ -189,7 +196,8 @@ Use deterministic terminal output for troubleshooting:
 
 Exit status `0` means the custom `mt7925e` resolves from this project's overlay
 and is loaded. Other states report stock resolution, an installed but unloaded
-driver, stale or incomplete build metadata, or an unknown module path.
+driver, stale or incomplete build metadata, or an unknown external module path.
+Only paths below the current kernel's `kernel/` tree are classified as stock.
 
 Inspect the real path selected by kmod for every module:
 
@@ -247,7 +255,9 @@ bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
 ./tests/test-compat.sh
 ./tests/test-rebuild.sh
 ./tests/test-module-overlay.sh
+./tests/test-real-depmod.sh
 ./tests/test-status.sh
+./tests/test-workflow.sh
 desktop-file-validate mt76-check.desktop mt76-status.desktop
 git diff --check
 ```

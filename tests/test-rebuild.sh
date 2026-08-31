@@ -24,6 +24,9 @@ OUTPUT=''
 FAIL_STAGE=''
 FAKE_ROOT=0
 FAKE_PATCHES=$'action-frame\naql\n'
+FLOCK_DIR=''
+INSTALL_READY=''
+INSTALL_RELEASE=''
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -174,6 +177,8 @@ case $2 in
     vermagic)
         if [[ $FAIL_STAGE == vermagic && ${3##*/} == mt76.ko ]]; then
             printf 'wrong-kernel SMP\n'
+        elif [[ $FAIL_STAGE == vermagic-prefix && ${3##*/} == mt76.ko ]]; then
+            printf '%s0 SMP\n' "$FAKE_KVER"
         else
             printf '%s SMP preempt mod_unload\n' "$FAKE_KVER"
         fi
@@ -185,6 +190,14 @@ case $2 in
         exit 2
         ;;
 esac
+EOF
+
+    cat > "$FAKE_BIN/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 2 && $1 == -n && $2 =~ ^[0-9]+$ ]] || exit 2
+[[ -n ${FAKE_FLOCK_DIR-} ]] || exit 0
+mkdir "$FAKE_FLOCK_DIR" 2>/dev/null
 EOF
 
     cat > "$FAKE_BIN/sudo" <<'EOF'
@@ -233,6 +246,12 @@ printf '%s\n' "$((count + 1))" > "$FAKE_INSTALL_COUNT"
 printf '%s\n' "$@" > "$FAKE_INSTALL_LOG"
 rm -rf "$FAKE_STAGE_SNAPSHOT"
 cp -R "$2" "$FAKE_STAGE_SNAPSHOT"
+if [[ -n ${FAKE_INSTALL_READY-} && $count -eq 0 ]]; then
+    : > "$FAKE_INSTALL_READY"
+    while [[ ! -e ${FAKE_INSTALL_RELEASE-} ]]; do
+        sleep 0.01
+    done
+fi
 EOF
 
     chmod +x \
@@ -251,6 +270,9 @@ run_rebuild() {
     FAKE_INSTALL_LOG="$INSTALL_LOG" \
     FAKE_INSTALL_COUNT="$INSTALL_COUNT" \
     FAKE_STAGE_SNAPSHOT="$STAGE_SNAPSHOT" \
+    FAKE_FLOCK_DIR="$FLOCK_DIR" \
+    FAKE_INSTALL_READY="$INSTALL_READY" \
+    FAKE_INSTALL_RELEASE="$INSTALL_RELEASE" \
     FAIL_STAGE="$FAIL_STAGE" \
     FAKE_PATCHES="$FAKE_PATCHES" \
     MT7925_WIRELESS_NEXT_REPO="$REMOTE" \
@@ -358,6 +380,69 @@ assert_shallow_clone() {
         fail "expected shallow main clone, got $(printf '%q' "$actual")"
 }
 
+assert_detached_source() {
+    [[ $("$REAL_GIT" -C "$RUN_ROOT/wireless-next" rev-parse HEAD) == "$SOURCE_SHA" ]] ||
+        fail 'source checkout is not at the fetched SHA'
+    if "$REAL_GIT" -C "$RUN_ROOT/wireless-next" symbolic-ref -q HEAD >/dev/null; then
+        fail 'source checkout remained attached to a branch'
+    fi
+}
+
+test_concurrent_rebuild_lock() {
+    local first_output="$RUN_ROOT/first-rebuild.output"
+    local second_output="$RUN_ROOT/second-rebuild.output"
+    local first_pid first_status second_status git_before git_after
+
+    clear_install
+    FAIL_STAGE=''
+    FLOCK_DIR="$RUN_ROOT/build-lock-held"
+    INSTALL_READY="$RUN_ROOT/first-install.ready"
+    INSTALL_RELEASE="$RUN_ROOT/first-install.release"
+    rm -rf "$FLOCK_DIR"
+    rm -f "$INSTALL_READY" "$INSTALL_RELEASE"
+
+    OUTPUT=$first_output
+    run_rebuild &
+    first_pid=$!
+    for _ in {1..1000}; do
+        [[ -e $INSTALL_READY ]] && break
+        sleep 0.01
+    done
+    [[ -e $INSTALL_READY ]] || {
+        touch "$INSTALL_RELEASE"
+        wait "$first_pid" || true
+        fail 'first rebuild did not reach the installer handoff'
+    }
+
+    git_before=$(wc -l < "$RUN_ROOT/git.log")
+    OUTPUT=$second_output
+    if run_rebuild; then
+        second_status=0
+    else
+        second_status=$?
+    fi
+    git_after=$(wc -l < "$RUN_ROOT/git.log")
+
+    touch "$INSTALL_RELEASE"
+    if wait "$first_pid"; then
+        first_status=0
+    else
+        first_status=$?
+    fi
+
+    [[ $first_status -eq 0 ]] || fail "first concurrent rebuild failed with $first_status"
+    [[ $second_status -ne 0 ]] || fail 'concurrent rebuild loser was accepted'
+    assert_contains "$second_output" 'another rebuild is already running'
+    [[ $git_after -eq $git_before ]] || fail 'concurrent rebuild loser wrote the shared source tree'
+    [[ $(<"$INSTALL_COUNT") == 1 ]] || fail 'concurrent rebuild loser reached the installer'
+
+    rm -rf "$FLOCK_DIR"
+    FLOCK_DIR=''
+    INSTALL_READY=''
+    INSTALL_RELEASE=''
+    OUTPUT="$RUN_ROOT/output"
+}
+
 assert_failure_before_install() {
     FAIL_STAGE=$1
     printf 'N\n' > "$SIG_ENFORCE"
@@ -408,6 +493,7 @@ fi
 assert_contains "$OUTPUT" "$SOURCE_SHA"
 assert_install_args 0 0
 assert_shallow_clone
+assert_detached_source
 assert_make_variables
 assert_pcie_only_build
 assert_stage $'kernel=7.2.0-test\nsource_sha='"$SOURCE_SHA"$'\ncompiler=clang version rebuild-test\npatches=action-frame,aql'
@@ -420,12 +506,15 @@ clear_install
 run_rebuild --disable-power-save || fail '--disable-power-save flow failed'
 assert_install_args 0 1
 
+test_concurrent_rebuild_lock
+
 assert_failure_before_install fetch
 assert_failure_before_install patch
 assert_failure_before_install build
 assert_failure_before_install expected-file
 assert_failure_before_install module-format
 assert_failure_before_install vermagic
+assert_failure_before_install vermagic-prefix
 assert_failure_before_install signature
 
 FAIL_STAGE=signature

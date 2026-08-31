@@ -15,11 +15,14 @@ MODPROBE=${MT7925_MODPROBE:-modprobe}
 DEPMOD=${MT7925_DEPMOD:-depmod}
 MODINFO=${MT7925_MODINFO:-modinfo}
 IW=${MT7925_IW:-iw}
+NETWORK_MANAGER=${MT7925_NETWORK_MANAGER:-NetworkManager}
+FLOCK=${MT7925_FLOCK:-flock}
 
 KVER=''
 KERNEL_ROOT=''
 UPDATES=''
 ACTIVE=''
+TRANSACTION_ROOT=''
 NEW=''
 PREVIOUS=''
 SETTINGS_TMP=''
@@ -53,6 +56,10 @@ die() {
 
 warn() {
     printf '%s: rollback warning: %s\n' "${0##*/}" "$*" >&2
+}
+
+cleanup_warn() {
+    printf '%s: cleanup warning: %s\n' "${0##*/}" "$*" >&2
 }
 
 module_loaded() {
@@ -251,6 +258,14 @@ resolve_command() {
     printf -v "$variable" '%s' "$resolved"
 }
 
+acquire_transaction_lock() {
+    local lock_file="$MODULES_ROOT/.$PROJECT.lock"
+
+    [[ ! -L $lock_file ]] || die "refusing symbolic-link lock file: $lock_file"
+    exec 9> "$lock_file" || die "could not open transaction lock: $lock_file"
+    "$FLOCK" -n 9 || die "another module transaction is already running for $MODULES_ROOT"
+}
+
 set_kernel_paths() {
     local kver=$1
 
@@ -267,9 +282,10 @@ set_kernel_paths() {
         [[ -d $UPDATES && ! -L $UPDATES ]] || die "unsafe updates directory: $UPDATES"
     fi
     ACTIVE="$UPDATES/$PROJECT"
-    NEW="$UPDATES/.$PROJECT.new"
-    PREVIOUS="$UPDATES/.$PROJECT.previous"
-    for path in "$ACTIVE" "$NEW" "$PREVIOUS"; do
+    TRANSACTION_ROOT="$MODULES_ROOT/.$PROJECT/$KVER"
+    NEW="$TRANSACTION_ROOT/new"
+    PREVIOUS="$TRANSACTION_ROOT/previous"
+    for path in "$ACTIVE" "$MODULES_ROOT/.$PROJECT" "$TRANSACTION_ROOT" "$NEW" "$PREVIOUS"; do
         [[ ! -L $path ]] || die "refusing symbolic-link transaction path: $path"
     done
 
@@ -277,8 +293,49 @@ set_kernel_paths() {
     DISPATCHER_TARGET="$ETC_ROOT/NetworkManager/dispatcher.d/99-$PROJECT"
 }
 
+validate_metadata() {
+    local file=$1 entry kernel='' source_sha='' compiler='' patches=''
+    local kernel_seen=0 source_seen=0 compiler_seen=0 patches_seen=0 lines=0
+
+    [[ -f $file && ! -L $file && -s $file ]] || die "invalid build metadata: $file"
+    while IFS= read -r entry; do
+        ((lines += 1))
+        case $entry in
+            kernel=*)
+                ((kernel_seen == 0)) || die 'duplicate kernel metadata'
+                kernel=${entry#kernel=}
+                kernel_seen=1
+                ;;
+            source_sha=*)
+                ((source_seen == 0)) || die 'duplicate source_sha metadata'
+                source_sha=${entry#source_sha=}
+                source_seen=1
+                ;;
+            compiler=*)
+                ((compiler_seen == 0)) || die 'duplicate compiler metadata'
+                compiler=${entry#compiler=}
+                compiler_seen=1
+                ;;
+            patches=*)
+                ((patches_seen == 0)) || die 'duplicate patches metadata'
+                patches=${entry#patches=}
+                patches_seen=1
+                ;;
+            *) die "unexpected build metadata field: $entry" ;;
+        esac
+    done < "$file"
+
+    [[ $lines -eq 4 && $kernel_seen -eq 1 && $source_seen -eq 1 &&
+       $compiler_seen -eq 1 && $patches_seen -eq 1 ]] ||
+        die 'build metadata must contain exactly kernel, source_sha, compiler, and patches'
+    [[ $kernel == "$KVER" ]] || die "stage metadata does not match $KVER"
+    [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || die 'source_sha metadata must be 40 lowercase hexadecimal characters'
+    [[ -n $compiler ]] || die 'compiler metadata must not be empty'
+    [[ -n $patches ]] || die 'patches metadata must not be empty'
+}
+
 validate_stage() {
-    local stage=$1 entry base kernel='' index
+    local stage=$1 entry base index
     local -a entries=()
 
     [[ -d $stage && ! -L $stage ]] || die "invalid stage directory: $stage"
@@ -299,19 +356,19 @@ validate_stage() {
     for index in "${!MODULE_FILES[@]}"; do
         [[ -f $stage/${MODULE_FILES[$index]} ]] || die "missing staged module: ${MODULE_FILES[$index]}"
     done
-    while IFS= read -r entry; do
-        case $entry in
-            kernel=*)
-                [[ -z $kernel ]] || die 'duplicate kernel metadata'
-                kernel=${entry#kernel=}
-                ;;
-        esac
-    done < "$stage/.build-info"
-    [[ $kernel == "$KVER" ]] || die "stage metadata does not match $KVER"
+    validate_metadata "$stage/.build-info"
+}
+
+require_power_save_dependencies() {
+    local disable_power_save=$1
+
+    ((disable_power_save)) || return 0
+    resolve_command IW "$IW"
+    resolve_command NETWORK_MANAGER "$NETWORK_MANAGER"
 }
 
 prepare_settings() {
-    local disable_aspm=$1 disable_power_save=$2 iw_quoted resolved=''
+    local disable_aspm=$1 disable_power_save=$2
     local manage_aspm=$disable_aspm manage_dispatcher=$disable_power_save
     local has_aspm=0 has_dispatcher=0
 
@@ -331,15 +388,7 @@ prepare_settings() {
     fi
 
     if ((disable_power_save || has_dispatcher)); then
-        if resolved=$(command -v "$IW"); then
-            IW=$resolved
-        elif ((disable_power_save)); then
-            die "required command not found: $IW"
-        fi
-    fi
-    if [[ -n $resolved ]]; then
         DISPATCHER_EXPECTED="$SETTINGS_TMP/dispatcher.generated"
-        printf -v iw_quoted '%q' "$IW"
         {
             printf '%s\n' '#!/usr/bin/env bash' "$GENERATED" '' 'set -euo pipefail' ''
             printf '%s\n' 'IFACE=${1-}' 'ACTION=${2-}'
@@ -348,7 +397,7 @@ prepare_settings() {
             printf '%s\n' '[[ -n ${CONNECTION_UUID-} && ${DEVICE_IFACE-} == "$IFACE" ]] || exit 0'
             printf '%s\n' 'module_path=$(readlink -f -- "/sys/class/net/$IFACE/device/driver/module" 2>/dev/null) || exit 0'
             printf '%s\n' '[[ ${module_path##*/} == mt7925e ]] || exit 0'
-            printf 'exec %s dev "$IFACE" set power_save off\n' "$iw_quoted"
+            printf '%s\n' 'exec iw dev "$IFACE" set power_save off'
         } > "$DISPATCHER_EXPECTED"
         chmod 755 "$DISPATCHER_EXPECTED"
     fi
@@ -418,7 +467,7 @@ activate_settings() {
 copy_overlay() {
     local stage=$1 file
 
-    mkdir -p "$UPDATES"
+    mkdir -p "$UPDATES" "$TRANSACTION_ROOT"
     [[ ! -e $PREVIOUS ]] || die "stale transaction directory requires revert: $PREVIOUS"
     rm -rf "$NEW"
     mkdir "$NEW"
@@ -426,6 +475,15 @@ copy_overlay() {
         cp "$stage/$file" "$NEW/$file"
         chmod 644 "$NEW/$file"
     done
+    validate_metadata "$NEW/.build-info"
+}
+
+cleanup_previous() {
+    if rm -rf "$PREVIOUS"; then
+        previous_moved=0
+    else
+        cleanup_warn "could not fully remove previous overlay at $PREVIOUS; verified state remains active"
+    fi
 }
 
 install_overlay() {
@@ -435,6 +493,7 @@ install_overlay() {
     [[ $disable_power_save == 0 || $disable_power_save == 1 ]] ||
         die 'DISABLE_POWER_SAVE must be 0 or 1'
     validate_stage "$stage"
+    require_power_save_dependencies "$disable_power_save"
     prepare_settings "$disable_aspm" "$disable_power_save"
     copy_overlay "$stage"
     transaction_started=1
@@ -450,17 +509,17 @@ install_overlay() {
 
     "$DEPMOD" -a "$KVER"
     verify_overlay_resolution
+    activate_settings
     "$MODPROBE" mt7925e
     verify_loaded_stack
-    activate_settings
 
-    rm -rf "$PREVIOUS"
-    previous_moved=0
     committed=1
+    cleanup_previous
     printf 'Installed mt7925 module overlay for %s.\n' "$KVER"
 }
 
 revert_overlay() {
+    prepare_settings 0 0
     transaction_started=1
     unload_stack
     rm -rf "$NEW" "$PREVIOUS"
@@ -470,16 +529,14 @@ revert_overlay() {
         previous_moved=1
     fi
 
-    prepare_settings 0 0
-    activate_settings
     "$DEPMOD" -a "$KVER"
     verify_stock_resolution
+    activate_settings
     "$MODPROBE" mt7925e
     verify_loaded_stack
 
-    rm -rf "$PREVIOUS"
-    previous_moved=0
     committed=1
+    cleanup_previous
     printf 'Reverted to stock mt7925 modules for %s.\n' "$KVER"
 }
 
@@ -487,16 +544,19 @@ require_safe_roots
 resolve_command MODPROBE "$MODPROBE"
 resolve_command DEPMOD "$DEPMOD"
 resolve_command MODINFO "$MODINFO"
+resolve_command FLOCK "$FLOCK"
 
 case ${1-} in
     install)
         [[ $# -eq 5 ]] || { usage; exit 2; }
         set_kernel_paths "$3"
+        acquire_transaction_lock
         install_overlay "$2" "$4" "$5"
         ;;
     revert)
         [[ $# -eq 2 ]] || { usage; exit 2; }
         set_kernel_paths "$2"
+        acquire_transaction_lock
         revert_overlay
         ;;
     *)

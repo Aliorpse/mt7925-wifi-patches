@@ -2,6 +2,7 @@
 wireless-next/
 openwrt-mt76/
 .worktrees/
+.mt7925-build.lock
 
 # Build artifacts
 *.o

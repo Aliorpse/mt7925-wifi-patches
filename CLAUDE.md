@@ -11,9 +11,10 @@ external modules: `mt76`, `mt76_connac_lib`, `mt792x_lib`, `mt7925_common`, and
 ## Source And Compatibility Contract
 
 `mt76-rebuild.sh` fetches `wireless-next/main`, validates the resolved
-40-character SHA, resets the checkout to that revision, and cleans it before
-each build. Current HEAD is intentional and can break when upstream source
-changes. Never describe it as a stable source pin.
+40-character SHA, forces a detached checkout at that revision, and cleans it
+before each build. A nonblocking repository-local lock covers source reset
+through installer handoff. Current HEAD is intentional and can break when
+upstream source changes. Never describe it as a stable source pin.
 
 `scripts/compat.sh` probes target headers and `Module.symvers` rather than
 selecting by release number. Its stdout is the stable patch-ID stream consumed
@@ -73,9 +74,9 @@ must produce and validate these files before privilege escalation:
 - `mt7925-common.ko`
 - `mt7925e.ko`
 
-Each staged file must be non-empty ELF relocatable output with vermagic matching
-`uname -r`. `.build-info` contains `kernel`, `source_sha`, `compiler`, and
-comma-separated `patches`.
+Each staged file must be non-empty ELF relocatable output whose first vermagic
+token exactly equals `uname -r`. `.build-info` contains exactly one each of
+`kernel`, `source_sha`, `compiler`, and comma-separated `patches`.
 
 When signature enforcement or lockdown is active, unsigned output must be
 refused before installation. There is no automatic key enrollment or signing
@@ -91,9 +92,15 @@ The privileged helper owns only the current kernel's external overlay:
 /lib/modules/$KVER/updates/mt7925-wifi-patches/
 ```
 
+Transaction `new` and `previous` directories live outside the kernel version
+tree at `/lib/modules/.mt7925-wifi-patches/$KVER/`. A nonblocking global
+`/lib/modules` lock serializes direct install and revert calls.
+
 An install stages a new directory, unloads the five-module stack, atomically
 activates the new overlay, runs `depmod -a "$KVER"`, verifies all five `modinfo`
-resolutions, loads `mt7925e`, and verifies the complete loaded stack. A failed
+resolutions, activates exact optional settings, loads `mt7925e`, and verifies
+the complete loaded stack. Verified state is committed before previous-overlay
+cleanup, so cleanup failure only warns. A failed
 transaction returns to the previous overlay or stock resolution and reports
 recovery verification failures. Distribution-owned module files under
 `/lib/modules/$KVER/kernel/` are never installation targets.
@@ -118,6 +125,8 @@ Power settings are opt-in only:
 
 The dispatcher acts only on a NetworkManager-managed interface whose driver
 module resolves to `mt7925e`. Both options can increase power consumption.
+`--disable-power-save` requires both `iw` and NetworkManager before transaction
+writes.
 Refuse user-owned target files. Remove only byte-identical project-generated
 settings; preserve locally changed files and print manual recovery paths when a
 transaction cannot restore prior content.
@@ -128,6 +137,10 @@ transaction cannot restore prior content.
 uses `modinfo -n mt7925e`, overlay metadata, `/proc/modules`, and the canonical
 sysfs driver-module link. Exit `0` means the custom driver is loaded; stock,
 unloaded, stale, missing, and unknown states are nonzero.
+Only the current kernel's `kernel/` tree is stock; other non-project paths are
+unknown external drivers. ASPM status comes from the live module parameter when
+available, and optional settings are selected only when byte-identical to their
+canonical generated content.
 
 Desktop entries use `Exec=mt76-check.sh`. User instructions must install the
 checker first:
@@ -148,10 +161,11 @@ Debian, and Arch Linux.
 
 ## CI And Verification
 
-CI resolves wireless-next HEAD once and passes that SHA to all five matrix
-entries: GCC on Linux 6.18, 7.0, 7.1, and 7.2, plus Clang/`LLVM=1` on Linux
-7.1. These source-tag jobs are API-only checks because `modules_prepare` lacks a
-complete `Module.symvers`. The separate Fedora Rawhide job selects its
+CI resolves wireless-next HEAD once and passes that SHA to all six matrix
+entries: GCC on Linux 6.18, 7.0, 7.1, and 7.2, Clang/`LLVM=1` on Linux 7.1,
+and a current-native GCC row using one wireless-next source/header generation.
+These jobs are API-only checks because `modules_prepare` lacks a complete
+`Module.symvers`. The separate Fedora Rawhide job selects its
 package-owned `kernel-devel` tree, requires the wireless headers and real
 `Module.symvers`, and uses strict modpost. Every build log must print the kernel
 ref, compiler, source SHA, detected feature states, and patch IDs even when
@@ -165,7 +179,9 @@ bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
 ./tests/test-compat.sh
 ./tests/test-rebuild.sh
 ./tests/test-module-overlay.sh
+./tests/test-real-depmod.sh
 ./tests/test-status.sh
+./tests/test-workflow.sh
 desktop-file-validate mt76-check.desktop mt76-status.desktop
 git diff --check
 ```

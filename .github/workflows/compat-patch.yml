@@ -47,7 +47,7 @@ jobs:
       - name: Install test and desktop tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes curl desktop-file-utils git
+          sudo apt-get install --yes build-essential curl desktop-file-utils git kmod util-linux
 
       - name: Check shell syntax
         run: bash -n mt76-rebuild.sh mt76-revert.sh mt76-check.sh scripts/*.sh tests/*.sh
@@ -61,11 +61,22 @@ jobs:
       - name: Test transactional module overlay
         run: ./tests/test-module-overlay.sh
 
+      - name: Test real depmod transaction isolation
+        run: ./tests/test-real-depmod.sh
+
       - name: Test status reporting
         run: ./tests/test-status.sh
 
       - name: Validate desktop entries
         run: desktop-file-validate mt76-check.desktop mt76-status.desktop
+
+      - name: Check whitespace errors
+        run: |
+          empty_tree=$(git hash-object -t tree /dev/null)
+          git diff --check "$empty_tree" HEAD
+
+      - name: Test workflow contract
+        run: ./tests/test-workflow.sh
 
   api-build:
     name: API compile (${{ matrix.kernel }}, ${{ matrix.toolchain }})
@@ -91,6 +102,9 @@ jobs:
           - kernel: v7.1
             toolchain: llvm
             patches: eml,nan,aql
+          - kernel: current-native
+            toolchain: gcc
+            patches: none
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -113,7 +127,7 @@ jobs:
             lld \
             llvm
 
-      - name: Build API-only source-tag check
+      - name: Build API-only source/header check
         shell: bash
         env:
           EXPECTED_PATCHES: ${{ matrix.patches }}
@@ -332,7 +346,7 @@ jobs:
             "$mt76_dir/mt792x-lib.ko"
           )
           mapfile -t modules < <(
-            find "$mt76_dir" -type f -name '*.ko' -print | sort
+            find "$mt76_dir" -type f -name '*.ko' -print | LC_ALL=C sort
           )
           [[ ${#modules[@]} -eq 5 ]]
           for index in "${!expected_modules[@]}"; do
@@ -346,7 +360,8 @@ jobs:
           for module in "${modules[@]}"; do
             [[ -s $module ]]
             vermagic=$(modinfo -F vermagic "$module")
-            [[ $vermagic == "$kver"* ]]
+            read -r module_kver _ <<< "$vermagic"
+            [[ $module_kver == "$kver" ]]
             depends=$(modinfo -F depends "$module")
             [[ -n $depends ]]
             case ${module##*/} in

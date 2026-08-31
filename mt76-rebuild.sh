@@ -10,6 +10,7 @@ SOURCE_ROOT="$SCRIPT_DIR/wireless-next"
 MT76_DIR="$SOURCE_ROOT/drivers/net/wireless/mediatek/mt76"
 SIG_ENFORCE_FILE="${MT7925_SIG_ENFORCE_FILE:-/sys/module/module/parameters/sig_enforce}"
 LOCKDOWN_FILE="${MT7925_LOCKDOWN_FILE:-/sys/kernel/security/lockdown}"
+FLOCK=${MT7925_FLOCK:-flock}
 disable_aspm=0
 disable_power_save=0
 signature_enforced=0
@@ -92,6 +93,12 @@ printf '==========================\n'
 printf 'Kernel: %s\n' "$KVER"
 printf 'Compiler: %s\n' "$compiler_identity"
 
+flock_command=$(command -v "$FLOCK") || die "required command not found: $FLOCK"
+build_lock="$SCRIPT_DIR/.mt7925-build.lock"
+[[ ! -L $build_lock ]] || die "refusing symbolic-link build lock: $build_lock"
+exec 9> "$build_lock" || die "could not open build lock: $build_lock"
+"$flock_command" -n 9 || die 'another rebuild is already running in this repository'
+
 if [[ ! -d $SOURCE_ROOT/.git ]]; then
     [[ ! -e $SOURCE_ROOT ]] || die "source path is not a git repository: $SOURCE_ROOT"
     git clone --depth=1 --branch main --no-checkout "$WIRELESS_NEXT_REPO" "$SOURCE_ROOT"
@@ -102,7 +109,7 @@ git -C "$SOURCE_ROOT" fetch --depth=1 origin main
 source_sha=$(git -C "$SOURCE_ROOT" rev-parse FETCH_HEAD)
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || die "invalid wireless-next SHA: $source_sha"
 printf 'wireless-next main resolves to %s.\n' "$source_sha"
-git -C "$SOURCE_ROOT" reset --hard "$source_sha"
+git -C "$SOURCE_ROOT" checkout --detach --force "$source_sha"
 git -C "$SOURCE_ROOT" clean -fdx
 
 patch_output=$("$SCRIPT_DIR/scripts/compat.sh" apply "$SOURCE_ROOT" "$KDIR")
@@ -168,7 +175,8 @@ for index in "${!source_modules[@]}"; do
         die "built file is not an ELF relocatable module: $staged_module"
 
     vermagic=$(modinfo -F vermagic "$staged_module")
-    [[ $vermagic == "$KVER"* ]] ||
+    read -r module_kver _ <<< "$vermagic"
+    [[ $module_kver == "$KVER" ]] ||
         die "module vermagic does not match $KVER: $staged_module"
 
     if [[ $signature_enforced -eq 1 ]]; then

@@ -269,7 +269,8 @@ assert_nan_contract_fail_closed() {
 }
 
 assert_kbuild_tool_args() {
-    local kdir fake_bin make_log output line expected calls=0
+    local kdir fake_bin make_log git_log output line expected calls=0
+    local kbuild_dir mt76_dir previous
     local -a expected_args=(
         LLVM=1
         LLVM_IAS=0
@@ -288,12 +289,14 @@ assert_kbuild_tool_args() {
     kdir=$(make_fixture current)
     fake_bin="$TEST_DIR/fake-build-bin"
     make_log="$TEST_DIR/fake-make.log"
+    git_log="$TEST_DIR/fake-build-git.log"
     output="$TEST_DIR/fake-build.stdout"
     mkdir -p "$fake_bin"
 
     cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -e
+printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
 
 case " $* " in
     *' clone '*)
@@ -302,7 +305,9 @@ case " $* " in
         cp -R "$FAKE_KDIR_FIXTURE/." "$destination/"
         ;;
     *' init '*)
-        mkdir -p "${!#}"
+        destination=${!#}
+        mkdir -p "$destination"
+        cp -R "$FAKE_KDIR_FIXTURE/." "$destination/"
         ;;
     *' rev-parse --is-inside-work-tree '*)
         printf '%s\n' true
@@ -314,8 +319,40 @@ esac
 EOF
     cat > "$fake_bin/make" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 printf '%s ' "$@" >> "$FAKE_MAKE_LOG"
 printf '\n' >> "$FAKE_MAKE_LOG"
+mt76_dir=''
+kdir=''
+previous=''
+for arg in "$@"; do
+    if [[ $previous == -C ]]; then
+        kdir=$arg
+    fi
+    case $arg in
+        M=*) mt76_dir=${arg#M=} ;;
+    esac
+    previous=$arg
+done
+if [[ " $* " == *' modules '* && -n $mt76_dir ]]; then
+    if [[ ${FAKE_REQUIRE_SYMVERS_FORMAT-0} == 1 ]]; then
+        expected=$'0x00000000\tieee80211_txq_aql_pending\tmac80211\tEXPORT_SYMBOL_GPL\t'
+        [[ $(<"$kdir/Module.symvers") == "$expected" ]] || {
+            printf 'invalid synthetic Module.symvers format\n' >&2
+            exit 1
+        }
+    fi
+    mkdir -p "$mt76_dir/mt7925"
+    for module in \
+        "$mt76_dir/mt76.ko" \
+        "$mt76_dir/mt76-connac-lib.ko" \
+        "$mt76_dir/mt792x-lib.ko" \
+        "$mt76_dir/mt7925/mt7925-common.ko" \
+        "$mt76_dir/mt7925/mt7925e.ko"; do
+        printf 'module\n' > "$module"
+    done
+    [[ ${FAKE_EXTRA_MODULE-0} == 0 ]] || printf 'extra\n' > "$mt76_dir/extra.ko"
+fi
 EOF
     cat > "$fake_bin/nproc" <<'EOF'
 #!/usr/bin/env bash
@@ -326,6 +363,7 @@ EOF
     PATH="$fake_bin:$PATH" \
     FAKE_KDIR_FIXTURE="$kdir" \
     FAKE_MAKE_LOG="$make_log" \
+    FAKE_GIT_LOG="$git_log" \
     LLVM=1 LLVM_IAS=0 CC=clang-test LD=ld.lld-test \
     AR=llvm-ar-test NM=llvm-nm-test STRIP=llvm-strip-test \
     OBJCOPY=llvm-objcopy-test OBJDUMP=llvm-objdump-test \
@@ -342,6 +380,47 @@ EOF
         done
     done < "$make_log"
     [[ $calls -eq 3 ]] || fail "expected 3 make calls, got $calls"
+
+    : > "$make_log"
+    : > "$git_log"
+    PATH="$fake_bin:$PATH" \
+    FAKE_KDIR_FIXTURE="$kdir" \
+    FAKE_MAKE_LOG="$make_log" \
+    FAKE_GIT_LOG="$git_log" \
+    KERNEL_REF=current-native \
+    WIRELESS_NEXT_REF=ca800a9302764c445de0da0e84d2252400a770ee \
+    FAKE_REQUIRE_SYMVERS_FORMAT=1 \
+    CC=clang-test \
+        "$BUILD_LEGACY" > "$output"
+
+    line=$(grep ' modules ' "$make_log")
+    kbuild_dir=''
+    mt76_dir=''
+    previous=''
+    for arg in $line; do
+        if [[ $previous == -C ]]; then
+            kbuild_dir=$arg
+        fi
+        case $arg in
+            M=*) mt76_dir=${arg#M=} ;;
+        esac
+        previous=$arg
+    done
+    [[ -n $kbuild_dir && $mt76_dir == "$kbuild_dir/drivers/net/wireless/mediatek/mt76" ]] ||
+        fail 'current-native build did not use one wireless-next source/header generation'
+    if grep -A1 '^Compatibility patches:$' "$output" | grep -Eq '^(action-frame|eml|nan|aql)$'; then
+        fail 'current-native build selected a compatibility patch'
+    fi
+
+    if PATH="$fake_bin:$PATH" \
+        FAKE_KDIR_FIXTURE="$kdir" \
+        FAKE_MAKE_LOG="$make_log" \
+        FAKE_GIT_LOG="$git_log" \
+        FAKE_EXTRA_MODULE=1 \
+        CC=clang-test \
+            "$BUILD_LEGACY" > "$output" 2>&1; then
+        fail 'API build accepted an unexpected sixth module output'
+    fi
 }
 
 assert_aql_without_symvers() {

@@ -3,6 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULES_ROOT=${MT7925_MODULES_ROOT:-/lib/modules}
+ETC_ROOT=${MT7925_ETC_ROOT:-/etc}
 confirmed=0
 
 usage() {
@@ -17,12 +19,18 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+KVER=$(uname -r)
+
 if ((confirmed == 0)); then
-    printf 'Remove the current kernel mt7925 overlay and project-owned settings? [y/N] '
+    printf 'This will remove:\n'
+    printf '  Overlay: %s\n' "$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches"
+    printf '  ASPM setting: %s\n' "$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+    printf '  Power-save setting: %s\n' "$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+    printf 'Continue? [y/N] '
     if ! IFS= read -r reply || [[ $reply != [Yy] && $reply != [Yy][Ee][Ss] ]]; then
         printf 'Aborted.\n'
         exit 0
     fi
 fi
 
-sudo "$SCRIPT_DIR/scripts/module-overlay.sh" revert "$(uname -r)"
+sudo "$SCRIPT_DIR/scripts/module-overlay.sh" revert "$KVER"
