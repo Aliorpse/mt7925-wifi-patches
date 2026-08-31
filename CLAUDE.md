@@ -24,6 +24,12 @@ by build metadata:
 - `nan`
 - `aql`
 
+Legacy NAN compatibility disables NAN and NDI as one unit when the host NAN
+contract is incomplete. Linux 6.18, 7.0, and 7.1 select that path. AQL
+compatibility restores the pre-AQL MT7925 sleeping-station branch instead of
+calling an unavailable or unexported helper; the tested old rows through Linux
+7.2 select it.
+
 Patch application is atomic: every selected patch passes `git apply --check`
 before source changes. Put compatibility changes in independently selectable
 files under `patches/`; do not tell users to edit the cleaned source checkout.
@@ -145,9 +151,11 @@ Debian, and Arch Linux.
 CI resolves wireless-next HEAD once and passes that SHA to all five matrix
 entries: GCC on Linux 6.18, 7.0, 7.1, and 7.2, plus Clang/`LLVM=1` on Linux
 7.1. These source-tag jobs are API-only checks because `modules_prepare` lacks a
-complete `Module.symvers`. The separate packaged-runner-header job uses a real
-`Module.symvers` and strict modpost. Every build log must print the kernel ref,
-compiler, source SHA, detected feature states, and patch IDs.
+complete `Module.symvers`. The separate Fedora Rawhide job selects its
+package-owned `kernel-devel` tree, requires the wireless headers and real
+`Module.symvers`, and uses strict modpost. Every build log must print the kernel
+ref, compiler, source SHA, detected feature states, and patch IDs even when
+feature detection fails.
 
 Run the full local suite after any behavioral, documentation, or workflow
 change:

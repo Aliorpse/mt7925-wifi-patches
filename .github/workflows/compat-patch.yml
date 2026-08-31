@@ -135,6 +135,8 @@ jobs:
           printf 'Kernel ref: %s\n' "$KERNEL_REF"
           printf 'Compiler: %s\n' "$compiler"
           printf 'Source SHA: %s\n' "$WIRELESS_NEXT_REF"
+          printf 'Detected features: pending\n'
+          printf 'Patch IDs: pending\n'
           printf '%s\n' 'Build mode: API-only; unresolved base-kernel symbols are warnings.'
 
           log=$(mktemp)
@@ -144,7 +146,9 @@ jobs:
           build_status=${PIPESTATUS[0]}
           set -e
 
-          if grep -Fqx 'Compatibility patches:' "$log"; then
+          if grep -Fqx \
+            'API compile check: KBUILD_MODPOST_WARN=1 because modules_prepare has no complete Module.symvers.' \
+            "$log"; then
             patch_ids=$(awk '
               /^Compatibility patches:$/ { capture = 1; next }
               /^API compile check:/ { capture = 0 }
@@ -155,18 +159,18 @@ jobs:
 
             feature_state() {
               if grep -Fqx "$1" <<< "$patch_ids"; then
-                printf compat
+                printf '%s' "$2"
               else
                 printf native
               fi
             }
             detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
-              "$(feature_state action-frame)" \
-              "$(feature_state eml)" \
-              "$(feature_state nan)" \
-              "$(feature_state aql)")
+              "$(feature_state action-frame legacy)" \
+              "$(feature_state eml legacy)" \
+              "$(feature_state nan disabled)" \
+              "$(feature_state aql pre-aql)")
           else
-            detected_features=unavailable
+            detected_features='action-frame=unknown,eml=unknown,nan=unknown,aql=unknown'
             patch_csv=unavailable
           fi
 
@@ -177,29 +181,32 @@ jobs:
           [[ $patch_csv == "$EXPECTED_PATCHES" ]]
 
   strict-packaged-header-build:
-    name: Strict packaged-runner-header build
+    name: Strict Fedora Rawhide kernel-devel build
     needs: resolve-source
     runs-on: ubuntu-latest
+    container: fedora:rawhide
     timeout-minutes: 45
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install packaged headers and kernel build tools
+      - name: Install Fedora kernel-devel and build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
+          dnf install --assumeyes \
             bc \
             bison \
-            build-essential \
             dwarves \
+            elfutils-libelf-devel \
             file \
+            findutils \
             flex \
+            gcc \
             git \
+            hostname \
+            kernel-devel \
             kmod \
-            libelf-dev \
-            libssl-dev \
-            "linux-headers-$(uname -r)"
+            make \
+            openssl-devel
+
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Build with strict modpost and real Module.symvers
         shell: bash
@@ -207,12 +214,26 @@ jobs:
           WIRELESS_NEXT_REF: ${{ needs.resolve-source.outputs.wireless_sha }}
         run: |
           set -euo pipefail
-          kver=$(uname -r)
-          kdir=$(realpath "/lib/modules/$kver/build")
+
+          kernel_package=$(rpm -q kernel-devel)
+          mapfile -t kdirs < <(
+            rpm -ql "$kernel_package" |
+              grep -E '^/usr/src/kernels/[^/]+/?$'
+          )
+          [[ ${#kdirs[@]} -eq 1 ]]
+          kdir=${kdirs[0]%/}
+          kver=$(make -s -C "$kdir" kernelrelease)
+          [[ ${kdir##*/} == "$kver" ]]
+
           symvers="$kdir/Module.symvers"
-          [[ -s $symvers ]]
-          header_owner=$(dpkg-query -S "$symvers")
-          header_owner=${header_owner%%:*}
+          required_headers=(
+            include/linux/ieee80211.h
+            include/linux/ieee80211-eht.h
+            include/linux/ieee80211-nan.h
+            include/uapi/linux/nl80211.h
+            include/net/cfg80211.h
+            include/net/mac80211.h
+          )
 
           source_dir="$RUNNER_TEMP/wireless-next-strict"
           git init --quiet "$source_dir"
@@ -224,30 +245,58 @@ jobs:
 
           compiler=$(gcc --version)
           compiler=${compiler%%$'\n'*}
+
+          printf 'Kernel ref: packaged %s (%s)\n' "$kver" "$kernel_package"
+          printf 'Compiler: %s\n' "$compiler"
+          printf 'Source SHA: %s\n' "$source_sha"
+          printf 'Detected features: pending\n'
+          printf 'Patch IDs: pending\n'
+          printf 'Module.symvers: %s\n' "$symvers"
+          printf '%s\n' 'Build mode: strict modpost; unresolved symbols are errors.'
+
+          [[ -s $symvers ]] || {
+            printf 'Required package file is missing: %s\n' "$symvers" >&2
+            exit 1
+          }
+          header_owner=$(rpm -qf "$symvers")
+          [[ $header_owner == "$kernel_package" ]]
+          for header in "${required_headers[@]}"; do
+            [[ -s $kdir/$header ]] || {
+              printf 'Required package header is missing: %s\n' "$kdir/$header" >&2
+              exit 1
+            }
+            [[ $(rpm -qf "$kdir/$header") == "$kernel_package" ]]
+          done
+
+          set +e
           patch_ids=$(./scripts/compat.sh detect "$kdir")
+          detect_status=$?
+          set -e
+          if ((detect_status != 0)); then
+            printf '%s\n' \
+              'Detected features: action-frame=unknown,eml=unknown,nan=unknown,aql=unknown'
+            printf 'Patch IDs: unavailable\n'
+            exit "$detect_status"
+          fi
+
           patch_csv=${patch_ids//$'\n'/,}
           [[ -n $patch_csv ]] || patch_csv=none
 
           feature_state() {
             if grep -Fqx "$1" <<< "$patch_ids"; then
-              printf compat
+              printf '%s' "$2"
             else
               printf native
             fi
           }
           detected_features=$(printf 'action-frame=%s,eml=%s,nan=%s,aql=%s' \
-            "$(feature_state action-frame)" \
-            "$(feature_state eml)" \
-            "$(feature_state nan)" \
-            "$(feature_state aql)")
+            "$(feature_state action-frame legacy)" \
+            "$(feature_state eml legacy)" \
+            "$(feature_state nan disabled)" \
+            "$(feature_state aql pre-aql)")
 
-          printf 'Kernel ref: packaged %s (%s)\n' "$kver" "$header_owner"
-          printf 'Compiler: %s\n' "$compiler"
-          printf 'Source SHA: %s\n' "$source_sha"
           printf 'Detected features: %s\n' "$detected_features"
           printf 'Patch IDs: %s\n' "$patch_csv"
-          printf 'Module.symvers: %s\n' "$symvers"
-          printf '%s\n' 'Build mode: strict modpost; unresolved symbols are errors.'
 
           applied=$(./scripts/compat.sh apply "$source_dir" "$kdir")
           [[ $applied == "$patch_ids" ]]
@@ -275,18 +324,49 @@ jobs:
             CONFIG_MT7925U=n \
             modules -j"$(nproc)"
 
-          modules=(
-            "$mt76_dir/mt76.ko"
+          expected_modules=(
             "$mt76_dir/mt76-connac-lib.ko"
-            "$mt76_dir/mt792x-lib.ko"
+            "$mt76_dir/mt76.ko"
             "$mt76_dir/mt7925/mt7925-common.ko"
             "$mt76_dir/mt7925/mt7925e.ko"
+            "$mt76_dir/mt792x-lib.ko"
           )
+          mapfile -t modules < <(
+            find "$mt76_dir" -type f -name '*.ko' -print | sort
+          )
+          [[ ${#modules[@]} -eq 5 ]]
+          for index in "${!expected_modules[@]}"; do
+            [[ ${modules[$index]} == "${expected_modules[$index]}" ]]
+          done
+
+          require_dependency() {
+            local dependencies=${1//-/_}
+            [[ ,$dependencies, == *",$2,"* ]]
+          }
           for module in "${modules[@]}"; do
             [[ -s $module ]]
             vermagic=$(modinfo -F vermagic "$module")
             [[ $vermagic == "$kver"* ]]
             depends=$(modinfo -F depends "$module")
+            [[ -n $depends ]]
+            case ${module##*/} in
+              mt76.ko)
+                require_dependency "$depends" mac80211
+                require_dependency "$depends" cfg80211
+                ;;
+              mt76-connac-lib.ko)
+                require_dependency "$depends" mt76
+                ;;
+              mt792x-lib.ko)
+                require_dependency "$depends" mt76_connac_lib
+                ;;
+              mt7925-common.ko)
+                require_dependency "$depends" mt792x_lib
+                ;;
+              mt7925e.ko)
+                require_dependency "$depends" mt7925_common
+                ;;
+            esac
             printf 'Module: %s; vermagic: %s; depends: %s\n' \
               "${module##*/}" "$vermagic" "$depends"
           done

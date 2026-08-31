@@ -27,12 +27,19 @@ CI tests these kernel API combinations against one resolved wireless-next SHA:
 | Linux 7.2 | GCC | API compile check |
 | Linux 7.1 | Clang with `LLVM=1` | API compile check |
 
+Legacy NAN compatibility disables NAN and NDI as one unit when the host NAN
+contract is incomplete. Linux 6.18, 7.0, and 7.1 select that path, so those
+rows do not provide NAN Data Interface support. The AQL compatibility path,
+selected by the tested old rows through Linux 7.2, restores the
+pre-AQL MT7925 sleeping-station branch instead of calling an unavailable or
+unexported AQL helper.
+
 Source-tag jobs use `modules_prepare` and permit unresolved base-kernel symbols,
 so they test API compatibility, not whether a module can be loaded. A separate
-CI job builds against the GitHub runner's packaged headers and real
-`Module.symvers` with strict modpost, dependency, and vermagic checks. This
-matrix does not certify other kernel configurations, distributions, or devices.
-The weekly CI run is the moving-HEAD canary.
+CI job builds against Fedora Rawhide's packaged `kernel-devel` tree and real
+`Module.symvers` with strict modpost, exact-module, dependency, and vermagic
+checks. This matrix does not certify other kernel configurations,
+distributions, or devices. The weekly CI run is the moving-HEAD canary.
 
 ## Requirements
 
