@@ -114,7 +114,7 @@ Kernel: $KVER
 Source: $source_sha
 Compiler: $compiler
 Patches: $patches
-Run: sudo modprobe mt7925e"
+Run: ./mt76-rebuild.sh"
         ;;
     stale)
         TITLE='MT7925 WiFi: Stale custom metadata'
@@ -122,21 +122,21 @@ Run: sudo modprobe mt7925e"
 Running kernel: $KVER
 Metadata kernel: $metadata_kernel
 Source: $source_sha
-Run: sudo ./mt76-rebuild.sh"
+Run: ./mt76-rebuild.sh"
         ;;
     missing)
         TITLE='MT7925 WiFi: Custom metadata missing'
         BODY="Driver: Custom (metadata missing or incomplete)
 Kernel: $KVER
 Metadata: $BUILD_INFO
-Run: sudo ./mt76-rebuild.sh"
+Run: ./mt76-rebuild.sh"
         ;;
     stock)
         TITLE='MT7925 WiFi: Stock driver'
         BODY="Driver: Stock (custom not installed)
 Kernel: $KVER
 Resolved module: $module_path
-Run: sudo ./mt76-rebuild.sh"
+Run: ./mt76-rebuild.sh"
         ;;
     *)
         TITLE='MT7925 WiFi: Driver state unknown'

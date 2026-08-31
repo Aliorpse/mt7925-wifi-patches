@@ -52,6 +52,22 @@ assert_not_contains() {
     fi
 }
 
+assert_rebuild_action() {
+    local line actions=0
+
+    while IFS= read -r line; do
+        case $line in
+            Run:*)
+                ((actions += 1))
+                [[ $line == 'Run: ./mt76-rebuild.sh' ]] ||
+                    fail "$OUTPUT contains the wrong remediation line: $line"
+                ;;
+        esac
+    done < "$OUTPUT"
+    [[ $actions -eq 1 ]] || fail "$OUTPUT contains $actions remediation lines, expected 1"
+    assert_not_contains "$OUTPUT" 'sudo ./mt76-rebuild.sh'
+}
+
 assert_file_equals() {
     local actual
 
@@ -176,6 +192,7 @@ test_stock_resolution_ignores_markers_and_similar_prefixes() {
     assert_status 1
     assert_contains "$OUTPUT" 'MT7925 WiFi: Stock driver'
     assert_contains "$OUTPUT" 'Driver: Stock (custom not installed)'
+    assert_rebuild_action
 
     similar="$MODULES_ROOT/$KVER/updates/mt7925-wifi-patches-old"
     mkdir -p "$similar"
@@ -184,6 +201,7 @@ test_stock_resolution_ignores_markers_and_similar_prefixes() {
     run_check --text
     assert_status 1
     assert_contains "$OUTPUT" 'Driver: Stock (custom not installed)'
+    assert_rebuild_action
     pass 'stock resolution ignores markers and non-overlay path prefixes'
 }
 
@@ -223,6 +241,7 @@ test_installed_custom_reports_unloaded() {
     assert_status 1
     assert_contains "$OUTPUT" 'MT7925 WiFi: Custom driver not loaded'
     assert_contains "$OUTPUT" 'Driver: Custom (installed, not loaded)'
+    assert_rebuild_action
     pass 'valid custom overlay is distinct when mt7925e is unloaded'
 }
 
@@ -236,12 +255,14 @@ test_stale_kernel_and_source_metadata() {
     assert_contains "$OUTPUT" 'MT7925 WiFi: Stale custom metadata'
     assert_contains "$OUTPUT" 'Driver: Custom (stale metadata)'
     assert_contains "$OUTPUT" 'Metadata kernel: 7.1.0-old-kernel'
+    assert_rebuild_action
 
     write_metadata "$KVER" not-a-wireless-next-sha
     run_check --text
     assert_status 1
     assert_contains "$OUTPUT" 'Driver: Custom (stale metadata)'
     assert_contains "$OUTPUT" 'Source: not-a-wireless-next-sha'
+    assert_rebuild_action
     pass 'kernel mismatch and invalid wireless-next SHA report stale metadata'
 }
 
@@ -255,12 +276,21 @@ test_missing_and_incomplete_metadata() {
     assert_status 1
     assert_contains "$OUTPUT" 'MT7925 WiFi: Custom metadata missing'
     assert_contains "$OUTPUT" 'Driver: Custom (metadata missing or incomplete)'
+    assert_rebuild_action
 
     printf 'kernel=%s\nsource_sha=%s\n' "$KVER" "$SHA" > "$OVERLAY/.build-info"
     run_check --text
     assert_status 1
     assert_contains "$OUTPUT" 'Driver: Custom (metadata missing or incomplete)'
+    assert_rebuild_action
     pass 'resolved overlay requires complete build metadata'
+}
+
+test_source_never_recommends_root_rebuild() {
+    if grep -Fq -- 'sudo ./mt76-rebuild.sh' "$CHECK"; then
+        fail 'checker source still recommends running the normal-user rebuild script with sudo'
+    fi
+    pass 'checker source never recommends a root rebuild invocation'
 }
 
 test_optional_settings_report_live_state_without_targeting_other_adapters() {
@@ -316,6 +346,7 @@ test_loaded_custom_reports_metadata_and_mt7925_interface
 test_installed_custom_reports_unloaded
 test_stale_kernel_and_source_metadata
 test_missing_and_incomplete_metadata
+test_source_never_recommends_root_rebuild
 test_optional_settings_report_live_state_without_targeting_other_adapters
 test_text_notification_and_missing_notifier_fallback_match
 printf 'Status and desktop-notification tests passed.\n'
