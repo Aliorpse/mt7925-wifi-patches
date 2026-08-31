@@ -150,31 +150,37 @@ matches_generated() {
     cmp -s "$file" "$expected"
 }
 
-restore_settings() {
-    local backup recovery
+restore_setting() {
+    local target=$1 expected=$2 installed=$3 backed_up=$4 name=$5
+    local backup="$SETTINGS_TMP/$name.previous" recovery
 
-    if ((aspm_installed)); then
-        rm -f "$ASPM_TARGET"
-    fi
-    if ((aspm_backed_up)); then
-        backup="$SETTINGS_TMP/aspm.previous"
-        if ! mv "$backup" "$ASPM_TARGET"; then
-            preserve_settings_tmp=1
-            printf -v recovery 'mv -- %q %q' "$backup" "$ASPM_TARGET"
-            warn "could not restore $ASPM_TARGET; backup preserved at $backup; restore it manually with: $recovery"
+    if ((installed)); then
+        if matches_generated "$target" "$expected"; then
+            rm -f "$target"
+        else
+            if ((backed_up)); then
+                preserve_settings_tmp=1
+                printf -v recovery 'diff -u -- %q %q' "$backup" "$target"
+                warn "live setting preserved at $target; previous backup preserved at $backup; compare with: $recovery; restore the backup manually after review"
+            else
+                warn "live setting preserved at $target; no previous backup exists"
+            fi
+            return 0
         fi
     fi
-    if ((dispatcher_installed)); then
-        rm -f "$DISPATCHER_TARGET"
-    fi
-    if ((dispatcher_backed_up)); then
-        backup="$SETTINGS_TMP/dispatcher.previous"
-        if ! mv "$backup" "$DISPATCHER_TARGET"; then
+    if ((backed_up)); then
+        if ! mv "$backup" "$target"; then
             preserve_settings_tmp=1
-            printf -v recovery 'mv -- %q %q' "$backup" "$DISPATCHER_TARGET"
-            warn "could not restore $DISPATCHER_TARGET; backup preserved at $backup; restore it manually with: $recovery"
+            printf -v recovery 'mv -- %q %q' "$backup" "$target"
+            warn "could not restore $target; backup preserved at $backup; restore it manually with: $recovery"
         fi
     fi
+}
+
+restore_settings() {
+    restore_setting "$ASPM_TARGET" "$ASPM_EXPECTED" "$aspm_installed" "$aspm_backed_up" aspm
+    restore_setting "$DISPATCHER_TARGET" "$DISPATCHER_EXPECTED" \
+        "$dispatcher_installed" "$dispatcher_backed_up" dispatcher
 }
 
 rollback() {
@@ -373,8 +379,16 @@ prepare_settings() {
         [[ -d ${DISPATCHER_TARGET%/*} && ! -L ${DISPATCHER_TARGET%/*} ]] ||
             die 'unsafe NetworkManager dispatcher directory'
     fi
-    [[ $disable_aspm == 0 ]] || ASPM_DESIRED=$ASPM_EXPECTED
-    [[ $disable_power_save == 0 ]] || DISPATCHER_DESIRED=$DISPATCHER_EXPECTED
+    if ((disable_aspm)); then
+        ASPM_DESIRED="$SETTINGS_TMP/aspm.new"
+        cp "$ASPM_EXPECTED" "$ASPM_DESIRED"
+        chmod 644 "$ASPM_DESIRED"
+    fi
+    if ((disable_power_save)); then
+        DISPATCHER_DESIRED="$SETTINGS_TMP/dispatcher.new"
+        cp "$DISPATCHER_EXPECTED" "$DISPATCHER_DESIRED"
+        chmod 755 "$DISPATCHER_DESIRED"
+    fi
 }
 
 activate_setting() {

@@ -25,6 +25,7 @@ FAIL_STAGE=''
 RUN_STATUS=0
 REAL_CP="$(command -v cp)"
 REAL_MV="$(command -v mv)"
+REAL_RM="$(command -v rm)"
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -156,7 +157,7 @@ if [[ ${FAKE_FAIL_STAGE-} == settings && $destination == "$FAKE_DISPATCHER_TARGE
 fi
 if [[ ${FAKE_FAIL_STAGE-} == settings-restore ]]; then
     source=$1
-    if [[ $source == */dispatcher.generated && $destination == "$FAKE_DISPATCHER_TARGET" ]]; then
+    if [[ $source == */dispatcher.new && $destination == "$FAKE_DISPATCHER_TARGET" ]]; then
         printf 'fake settings activation failure\n' >&2
         exit 71
     fi
@@ -166,6 +167,19 @@ if [[ ${FAKE_FAIL_STAGE-} == settings-restore ]]; then
     fi
 fi
 exec "$FAKE_REAL_MV" "$@"
+EOF
+
+    cat > "$FAKE_BIN/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target=${!#}
+if [[ ${FAKE_FAIL_STAGE-} == settings-live-modified && $target == */.mt7925-wifi-patches.previous && ! -e $FAKE_FAIL_MARKER ]]; then
+    printf '# transaction-time local modification\n' >> "$FAKE_ASPM_TARGET"
+    : > "$FAKE_FAIL_MARKER"
+    printf 'fake finalization failure after live settings modification\n' >&2
+    exit 76
+fi
+exec "$FAKE_REAL_RM" "$@"
 EOF
 
     cat > "$FAKE_BIN/depmod" <<'EOF'
@@ -339,9 +353,11 @@ run_overlay() {
         FAKE_IW_LOG="$IW_LOG" \
         FAKE_FAIL_STAGE="$FAIL_STAGE" \
         FAKE_FAIL_MARKER="$FAIL_MARKER" \
+        FAKE_ASPM_TARGET="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf" \
         FAKE_DISPATCHER_TARGET="$dispatcher" \
         FAKE_REAL_CP="$REAL_CP" \
         FAKE_REAL_MV="$REAL_MV" \
+        FAKE_REAL_RM="$REAL_RM" \
         FAKE_KVER="$KVER" \
         "$HELPER" "$@" > "$OUTPUT" 2>&1; then
         RUN_STATUS=0
@@ -635,6 +651,45 @@ test_failed_settings_restore_preserves_backup() {
     pass 'failed settings restore preserves byte-identical backup with recovery instructions'
 }
 
+test_modified_live_setting_and_previous_backup_survive_rollback() {
+    local old_stage new_stage config dispatcher old_config old_dispatcher live_config backup
+    local -a preserved=()
+
+    reset_fixture
+    old_stage=$(make_stage live-preserve-old old)
+    run_overlay install "$old_stage" "$KVER" 1 1
+    assert_success
+    config="$ETC_ROOT/modprobe.d/99-mt7925-wifi-patches.conf"
+    dispatcher="$ETC_ROOT/NetworkManager/dispatcher.d/99-mt7925-wifi-patches"
+    old_config=$(<"$config")
+    old_dispatcher=$(<"$dispatcher")
+    live_config="$old_config"$'\n# transaction-time local modification'
+
+    new_stage=$(make_stage live-preserve-new new)
+    FAIL_STAGE=settings-live-modified
+    run_overlay install "$new_stage" "$KVER" 1 1
+    assert_failure
+    [[ $RUN_STATUS -eq 76 ]] || fail "rollback replaced original status 76 with $RUN_STATUS"
+    assert_file_equals "$config" "$live_config"
+
+    shopt -s nullglob
+    preserved=("$ETC_ROOT"/.mt7925-wifi-patches.*)
+    shopt -u nullglob
+    [[ ${#preserved[@]} -eq 1 ]] || fail "expected one preserved settings directory, got ${#preserved[@]}"
+    backup="${preserved[0]}/aspm.previous"
+    assert_file_equals "$backup" "$old_config"
+    assert_file_equals "$dispatcher" "$old_dispatcher"
+    assert_contains "$OUTPUT" "live setting preserved at $config"
+    assert_contains "$OUTPUT" "previous backup preserved at $backup"
+    assert_contains "$OUTPUT" 'compare with: diff -u --'
+    assert_overlay_tag old
+    assert_resolves_overlay
+    assert_loaded_stack
+    assert_no_transaction_siblings
+    assert_package_unchanged
+    pass 'rollback preserves modified live setting and previous backup with recovery instructions'
+}
+
 test_exact_generated_settings_replace_and_revert() {
     local old_stage new_stage config dispatcher
 
@@ -846,6 +901,7 @@ test_stock_rollbacks
 test_rollback_verification_warnings
 test_previous_overlay_and_settings_rollback
 test_failed_settings_restore_preserves_backup
+test_modified_live_setting_and_previous_backup_survive_rollback
 test_exact_generated_settings_replace_and_revert
 test_modified_generated_settings_are_user_owned
 test_user_owned_settings
