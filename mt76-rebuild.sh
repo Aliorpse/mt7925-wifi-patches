@@ -1,112 +1,108 @@
-#!/bin/bash
-# MT7925 WiFi Driver Rebuild Script
-# Builds and installs custom mt76 modules from wireless-next
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KVER=$(uname -r)
-KDIR="/lib/modules/$KVER/build"
-SRC_DIR="$SCRIPT_DIR/wireless-next/drivers/net/wireless/mediatek/mt76"
-MOD_DIR="/lib/modules/$KVER/kernel/drivers/net/wireless/mediatek/mt76"
-BACKUP_DIR="$SCRIPT_DIR/backup-modules"
-COMPAT_PATCH="$SCRIPT_DIR/patches/legacy-action-frame-api.patch"
+WIRELESS_NEXT_REPO="${MT7925_WIRELESS_NEXT_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git}"
+KVER="$(uname -r)"
+KDIR="${MT7925_KDIR:-/lib/modules/$KVER/build}"
+SOURCE_ROOT="$SCRIPT_DIR/wireless-next"
+MT76_DIR="$SOURCE_ROOT/drivers/net/wireless/mediatek/mt76"
+SIG_ENFORCE_FILE="${MT7925_SIG_ENFORCE_FILE:-/sys/module/module/parameters/sig_enforce}"
+disable_aspm=0
+disable_power_save=0
+signature_enforced=0
+stage_dir=''
+KBUILD_TOOL_ARGS=()
 
-restore_compat_patch() {
-    local patch_state="$SCRIPT_DIR/wireless-next/.git/mt7925-legacy-action-api-patch"
-
-    if [[ ! -f "$patch_state" ]]; then
-        return
-    fi
-
-    if ! git -C wireless-next apply --reverse --check "$COMPAT_PATCH"; then
-        echo "ERROR: Cannot restore the wireless-next source before updating."
-        echo "Remove wireless-next and run this script again."
-        exit 1
-    fi
-
-    git -C wireless-next apply --reverse "$COMPAT_PATCH"
-    rm -f "$patch_state"
+usage() {
+    printf 'usage: %s [--disable-aspm] [--disable-power-save] [--help]\n' "${0##*/}"
 }
 
-apply_compat_patch() {
-    local ieee80211_header="$KDIR/include/linux/ieee80211.h"
-    local patch_state="$SCRIPT_DIR/wireless-next/.git/mt7925-legacy-action-api-patch"
-
-    if [[ ! -f "$ieee80211_header" ]]; then
-        echo "ERROR: Kernel header not found at $ieee80211_header"
-        exit 1
-    fi
-
-    # Linux kernels before the action-frame API change use an object-like
-    # IEEE80211_MIN_ACTION_SIZE macro and keep action_code in each frame type.
-    if grep -Eq '^[[:space:]]*#define[[:space:]]+IEEE80211_MIN_ACTION_SIZE\(' "$ieee80211_header"; then
-        return
-    fi
-
-    if ! grep -Eq '^[[:space:]]*#define[[:space:]]+IEEE80211_MIN_ACTION_SIZE[[:space:]]' "$ieee80211_header"; then
-        echo "ERROR: Unsupported IEEE 802.11 action-frame API in $ieee80211_header"
-        exit 1
-    fi
-
-    echo "Applying compatibility patch for the installed kernel headers..."
-    if git -C wireless-next apply --check "$COMPAT_PATCH"; then
-        git -C wireless-next apply "$COMPAT_PATCH"
-        touch "$patch_state"
-    elif git -C wireless-next apply --reverse --check "$COMPAT_PATCH"; then
-        echo "wireless-next already uses the compatible action-frame API."
-    else
-        echo "ERROR: wireless-next changed and the kernel compatibility patch no longer applies."
-        echo "Please open an issue and include your kernel version: $KVER"
-        exit 1
-    fi
-}
-
-echo "MT7925 WiFi Driver Rebuild"
-echo "=========================="
-echo "Kernel: $KVER"
-echo ""
-
-# Check for root
-if [[ $EUID -ne 0 ]]; then
-    echo "This script needs root privileges."
-    exec sudo "$0" "$@"
-fi
-
-# Check for kernel headers
-if [[ ! -d "$KDIR" ]]; then
-    echo "ERROR: Kernel headers not found at $KDIR"
-    echo "Install with: sudo dnf install kernel-devel kernel-headers"
+die() {
+    printf 'mt76-rebuild.sh: %s\n' "$*" >&2
     exit 1
-fi
+}
 
-cd "$SCRIPT_DIR"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --disable-aspm)
+            disable_aspm=1
+            ;;
+        --disable-power-save)
+            disable_power_save=1
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
 
-# Clone wireless-next if not present
-if [[ ! -d "wireless-next" ]]; then
-    echo "[1/6] Cloning wireless-next tree (this may take a while)..."
-    git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/wireless/wireless-next.git
+user_id=$(id -u)
+[[ $user_id =~ ^[0-9]+$ ]] || die "could not determine the current user"
+[[ $user_id -ne 0 ]] || die "run this script as a normal user, without sudo"
+[[ -d $KDIR ]] || die "kernel build directory not found: $KDIR"
+[[ -r $SIG_ENFORCE_FILE ]] ||
+    die "cannot determine module signature enforcement from $SIG_ENFORCE_FILE"
+
+signature_state=$(<"$SIG_ENFORCE_FILE")
+case $signature_state in
+    1|Y|y) signature_enforced=1 ;;
+    0|N|n) ;;
+    *) die "unknown module signature enforcement state: $signature_state" ;;
+esac
+
+for tool in LLVM LLVM_IAS CC LD AR NM STRIP OBJCOPY OBJDUMP READELF HOSTCC HOSTCXX; do
+    if declare -p "$tool" >/dev/null 2>&1; then
+        KBUILD_TOOL_ARGS+=("$tool=${!tool-}")
+    fi
+done
+
+if [[ -n ${CC-} ]]; then
+    compiler_command=$CC
+elif [[ -n ${LLVM-} ]]; then
+    compiler_command=clang
 else
-    echo "[1/6] Updating wireless-next source..."
-    restore_compat_patch
-    git -C wireless-next pull --ff-only 2>/dev/null || echo "Already up to date or offline"
+    compiler_command=gcc
+fi
+compiler_identity=$("$compiler_command" --version)
+compiler_identity=${compiler_identity%%$'\n'*}
+[[ -n $compiler_identity ]] || die "could not identify compiler: $compiler_command"
+
+printf 'MT7925 WiFi Driver Rebuild\n'
+printf '==========================\n'
+printf 'Kernel: %s\n' "$KVER"
+printf 'Compiler: %s\n' "$compiler_identity"
+
+if [[ ! -d $SOURCE_ROOT/.git ]]; then
+    [[ ! -e $SOURCE_ROOT ]] || die "source path is not a git repository: $SOURCE_ROOT"
+    git clone --no-checkout "$WIRELESS_NEXT_REPO" "$SOURCE_ROOT"
 fi
 
-apply_compat_patch
+git -C "$SOURCE_ROOT" remote set-url origin "$WIRELESS_NEXT_REPO"
+git -C "$SOURCE_ROOT" fetch --depth=1 origin main
+source_sha=$(git -C "$SOURCE_ROOT" rev-parse FETCH_HEAD)
+[[ $source_sha =~ ^[0-9a-f]{40}$ ]] || die "invalid wireless-next SHA: $source_sha"
+printf 'wireless-next main resolves to %s.\n' "$source_sha"
+git -C "$SOURCE_ROOT" reset --hard "$source_sha"
+git -C "$SOURCE_ROOT" clean -fdx
 
-# Backup original modules (first run only)
-if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
-    echo "[2/6] Backing up original modules..."
-    mkdir -p "$BACKUP_DIR"
-    cp -r "$MOD_DIR"/* "$BACKUP_DIR/" 2>/dev/null || true
+patch_output=$("$SCRIPT_DIR/scripts/compat.sh" apply "$SOURCE_ROOT" "$KDIR")
+if [[ -n $patch_output ]]; then
+    patches=${patch_output//$'\n'/,}
 else
-    echo "[2/6] Backup already exists, skipping..."
+    patches=none
 fi
+printf 'Compatibility patches: %s\n' "$patches"
 
-# Build
-echo "[3/6] Building modules..."
-make -C "$KDIR" M="$SRC_DIR" clean 2>/dev/null || true
-make -C "$KDIR" M="$SRC_DIR" \
+make "${KBUILD_TOOL_ARGS[@]}" -C "$KDIR" M="$MT76_DIR" clean
+make "${KBUILD_TOOL_ARGS[@]}" -C "$KDIR" M="$MT76_DIR" \
     CONFIG_MT76_CORE=m \
     CONFIG_MT76_CONNAC_LIB=m \
     CONFIG_MT792x_LIB=m \
@@ -114,56 +110,56 @@ make -C "$KDIR" M="$SRC_DIR" \
     CONFIG_MT7925E=m \
     modules -j"$(nproc)"
 
-# Unload current modules
-echo "[4/6] Unloading current modules..."
-modprobe -r mt7925e 2>/dev/null || true
-modprobe -r mt7925_common 2>/dev/null || true
-modprobe -r mt792x_lib 2>/dev/null || true
-modprobe -r mt76_connac_lib 2>/dev/null || true
-modprobe -r mt76 2>/dev/null || true
+stage_dir=$(mktemp -d)
+cleanup() {
+    rm -rf "$stage_dir"
+}
+trap cleanup EXIT
 
-# Install
-echo "[5/6] Installing new modules..."
-mkdir -p "$MOD_DIR/mt7925"
-cp "$SRC_DIR/mt76.ko" "$MOD_DIR/"
-cp "$SRC_DIR/mt76-connac-lib.ko" "$MOD_DIR/"
-cp "$SRC_DIR/mt792x-lib.ko" "$MOD_DIR/"
-cp "$SRC_DIR/mt7925/mt7925-common.ko" "$MOD_DIR/mt7925/"
-cp "$SRC_DIR/mt7925/mt7925e.ko" "$MOD_DIR/mt7925/"
+source_modules=(
+    mt76.ko
+    mt76-connac-lib.ko
+    mt792x-lib.ko
+    mt7925/mt7925-common.ko
+    mt7925/mt7925e.ko
+)
+staged_modules=(
+    mt76.ko
+    mt76-connac-lib.ko
+    mt792x-lib.ko
+    mt7925-common.ko
+    mt7925e.ko
+)
 
-# Mark as custom
-echo "$KVER - $(date)" > "$MOD_DIR/.custom-mt76"
+for index in "${!source_modules[@]}"; do
+    source_module="$MT76_DIR/${source_modules[$index]}"
+    staged_module="$stage_dir/${staged_modules[$index]}"
+    cp "$source_module" "$staged_module"
+    [[ -s $staged_module ]] || die "built module is empty: $source_module"
 
-# Disable ASPM for stability
-MODPROBE_CONF="/etc/modprobe.d/mt7925.conf"
-if [[ ! -f "$MODPROBE_CONF" ]]; then
-    echo "options mt7925e disable_aspm=1" > "$MODPROBE_CONF"
-    echo "Created $MODPROBE_CONF (ASPM disabled for stability)"
-fi
+    module_format=$(file -b "$staged_module")
+    [[ $module_format == *ELF*relocatable* ]] ||
+        die "built file is not an ELF relocatable module: $staged_module"
 
-# Disable WiFi power save for stability
-POWERSAVE_SCRIPT="/etc/NetworkManager/dispatcher.d/99-mt7925-powersave-off"
-if [[ ! -f "$POWERSAVE_SCRIPT" ]]; then
-    cat > "$POWERSAVE_SCRIPT" << 'SCRIPT'
-#!/bin/bash
-# Disable power save for MT7925 WiFi
-IFACE="$1"
-ACTION="$2"
-if [[ "$ACTION" == "up" ]] && iw dev "$IFACE" info 2>/dev/null | grep -q "type managed"; then
-    iw dev "$IFACE" set power_save off 2>/dev/null
-fi
-SCRIPT
-    chmod +x "$POWERSAVE_SCRIPT"
-    echo "Created $POWERSAVE_SCRIPT (WiFi power save disabled)"
-fi
+    vermagic=$(modinfo -F vermagic "$staged_module")
+    [[ $vermagic == "$KVER"* ]] ||
+        die "module vermagic does not match $KVER: $staged_module"
 
-depmod -a
+    if [[ $signature_enforced -eq 1 ]]; then
+        if ! signer=$(modinfo -F signer "$staged_module"); then
+            die "could not inspect module signature: $staged_module"
+        fi
+        [[ -n $signer ]] ||
+            die "module signatures are enforced but $staged_module is unsigned; sign the modules before installing"
+    fi
+done
 
-# Load
-echo "[6/6] Loading new modules..."
-modprobe mt7925e
+printf 'kernel=%s\nsource_sha=%s\ncompiler=%s\npatches=%s\n' \
+    "$KVER" "$source_sha" "$compiler_identity" "$patches" \
+    > "$stage_dir/.build-info"
 
-echo ""
-echo "✓ Done! Custom mt76 modules installed for kernel $KVER"
-echo ""
-lsmod | grep mt79
+install_helper=${MT7925_INSTALL_HELPER:-$SCRIPT_DIR/scripts/module-overlay.sh}
+sudo "$install_helper" install \
+    "$stage_dir" "$KVER" "$disable_aspm" "$disable_power_save"
+
+printf 'Custom mt76 modules installed for kernel %s.\n' "$KVER"

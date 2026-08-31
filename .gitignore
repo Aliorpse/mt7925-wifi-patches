@@ -3,9 +3,6 @@ wireless-next/
 openwrt-mt76/
 .worktrees/
 
-# Backup modules
-backup-modules/
-
 # Build artifacts
 *.o
 *.ko
