@@ -428,6 +428,34 @@ assert_failure_before_install module-format
 assert_failure_before_install vermagic
 assert_failure_before_install signature
 
+FAIL_STAGE=signature
+printf 'N\n' > "$SIG_ENFORCE"
+rm -f "$LOCKDOWN"
+clear_install
+if ! run_rebuild; then
+    fail 'absent lockdown interface blocked normal flow'
+fi
+assert_install_args 0 0
+
+printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
+clear_install
+if ! run_rebuild; then
+    fail 'inactive lockdown rejected unsigned modules'
+fi
+assert_install_args 0 0
+
+FAIL_STAGE=''
+printf 'N\n' > "$SIG_ENFORCE"
+chmod 000 "$LOCKDOWN"
+clear_install
+if run_rebuild; then
+    chmod 600 "$LOCKDOWN"
+    fail 'existing unreadable lockdown interface was accepted'
+fi
+chmod 600 "$LOCKDOWN"
+assert_contains "$OUTPUT" 'cannot determine kernel lockdown state'
+assert_no_install
+
 for lockdown_state in 'none [integrity] confidentiality' 'none integrity [confidentiality]'; do
     FAIL_STAGE=signature
     printf 'N\n' > "$SIG_ENFORCE"
@@ -438,6 +466,27 @@ for lockdown_state in 'none [integrity] confidentiality' 'none integrity [confid
     fi
     assert_no_install
 done
+
+for lockdown_state in 'none [integrity] confidentiality' 'none integrity [confidentiality]'; do
+    FAIL_STAGE=''
+    printf 'N\n' > "$SIG_ENFORCE"
+    printf '%s\n' "$lockdown_state" > "$LOCKDOWN"
+    clear_install
+    if ! run_rebuild; then
+        fail "signed modules were rejected under lockdown: $lockdown_state"
+    fi
+    assert_install_args 0 0
+done
+
+FAIL_STAGE=signature
+printf 'Y\n' > "$SIG_ENFORCE"
+rm -f "$LOCKDOWN"
+clear_install
+if run_rebuild; then
+    fail 'sig_enforce accepted unsigned modules without lockdown interface'
+fi
+assert_contains "$OUTPUT" 'unsigned'
+assert_no_install
 
 FAIL_STAGE=''
 printf 'N\n' > "$SIG_ENFORCE"
@@ -459,7 +508,7 @@ assert_no_install
 
 FAKE_PATCHES=''
 printf 'Y\n' > "$SIG_ENFORCE"
-printf '[none] integrity confidentiality\n' > "$LOCKDOWN"
+rm -f "$LOCKDOWN"
 clear_install
 if ! run_rebuild --disable-aspm --disable-power-save; then
     fail "signed optional-settings flow failed: $(<"$OUTPUT")"

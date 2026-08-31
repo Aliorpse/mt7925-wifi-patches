@@ -51,8 +51,6 @@ user_id=$(id -u)
 [[ -d $KDIR ]] || die "kernel build directory not found: $KDIR"
 [[ -r $SIG_ENFORCE_FILE ]] ||
     die "cannot determine module signature enforcement from $SIG_ENFORCE_FILE"
-[[ -r $LOCKDOWN_FILE ]] ||
-    die "cannot determine kernel lockdown state from $LOCKDOWN_FILE"
 
 signature_state=$(<"$SIG_ENFORCE_FILE")
 case $signature_state in
@@ -61,12 +59,16 @@ case $signature_state in
     *) die "unknown module signature enforcement state: $signature_state" ;;
 esac
 
-lockdown_state=$(<"$LOCKDOWN_FILE")
-case $lockdown_state in
-    *'[integrity]'*|*'[confidentiality]'*) signature_enforced=1 ;;
-    *'[none]'*) ;;
-    *) die "unknown kernel lockdown state: $lockdown_state" ;;
-esac
+if [[ -e $LOCKDOWN_FILE ]]; then
+    [[ -r $LOCKDOWN_FILE ]] ||
+        die "cannot determine kernel lockdown state from $LOCKDOWN_FILE"
+    lockdown_state=$(<"$LOCKDOWN_FILE")
+    case $lockdown_state in
+        *'[integrity]'*|*'[confidentiality]'*) signature_enforced=1 ;;
+        *'[none]'*) ;;
+        *) die "unknown kernel lockdown state: $lockdown_state" ;;
+    esac
+fi
 
 for tool in LLVM LLVM_IAS CC LD AR NM STRIP OBJCOPY OBJDUMP READELF HOSTCC HOSTCXX; do
     if declare -p "$tool" >/dev/null 2>&1; then
