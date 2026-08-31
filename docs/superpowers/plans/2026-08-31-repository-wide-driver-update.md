@@ -474,11 +474,12 @@ Add jobs for:
 strategy:
   fail-fast: false
   matrix:
-    kernel: [v6.18, v7.0, v7.1, v7.2]
-    toolchain: [gcc]
-include:
-  - kernel: v7.1
-    toolchain: llvm
+    include:
+      - { kernel: v6.18, toolchain: gcc }
+      - { kernel: v7.0, toolchain: gcc }
+      - { kernel: v7.1, toolchain: gcc }
+      - { kernel: v7.2, toolchain: gcc }
+      - { kernel: v7.1, toolchain: llvm }
 ```
 
 Resolve wireless-next HEAD once in a small job and pass the SHA to matrix jobs. Add static shell tests, all local test scripts, desktop validation, and a strict packaged-runner-header build with real `Module.symvers`. Keep the weekly schedule as the moving-HEAD canary and raise build timeouts to realistic matrix limits.
